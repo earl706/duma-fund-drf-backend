@@ -1,0 +1,146 @@
+# ---------------------------------------------------------------------------
+# Backend — keep secrets, local DBs, envs, caches, and test noise out of git
+# ---------------------------------------------------------------------------
+
+# Environment & secrets (never commit real credentials)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa*
+id_ed25519*
+*.keystore
+credentials.json
+service-account*.json
+*-credentials.json
+secrets/
+.secrets/
+.aws/
+.gcloud/
+.config/gcloud/
+
+# Local databases & dumps
+*.sqlite3
+*.sqlite3-*
+db.sqlite3
+*.db
+*.dump
+*.sql.gz
+*.pgsql
+dump.rdb
+postgres-data/
+pgdata/
+*.backup
+
+# Virtual environments
+venv/
+.venv/
+backend-env/
+env/
+ENV/
+.python-version
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.so
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+.dmypy.json
+dmypy.json
+.cache/
+.hypothesis/
+
+# Packaging / install artifacts
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Django runtime artifacts
+staticfiles/
+media/
+local_settings.py
+*.log
+logs/
+celerybeat-schedule
+celerybeat-schedule.*
+celerybeat.pid
+*.pid
+
+# Tests, coverage, and local QA (keep unfinished / private suites off public remotes)
+tests/
+test/
+**/tests/
+**/test/
+test_*.py
+*_test.py
+*_tests.py
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.cache/pytest/
+.cache/coverage/
+factoryboy/
+fixtures/private/
+fixtures/local/
+
+# Type checkers / profilers / notebooks
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+.spyderproject
+.spyproject
+.ropeproject
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.temp
+
+# Local scratch / debug
+scratch/
+tmp/
+temp/
+.debug/
+*.local
