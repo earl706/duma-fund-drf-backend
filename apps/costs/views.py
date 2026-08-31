@@ -22,12 +22,13 @@ LINE_TOTAL = ExpressionWrapper(
 class CostListViewSet(OwnedModelViewSet):
     serializer_class = CostListSerializer
     queryset = CostList.objects.all()
-    filterset_fields = ["status", "date_created"]
+    filterset_fields = ["status", "date_created", "date_effective"]
     search_fields = ["title", "description"]
     ordering_fields = [
         "title",
         "status",
         "date_created",
+        "date_effective",
         "date_last_modified",
         "created_at",
         "updated_at",
@@ -54,7 +55,7 @@ class CostListViewSet(OwnedModelViewSet):
 class CostItemViewSet(OwnedModelViewSet):
     serializer_class = CostItemSerializer
     queryset = CostItem.objects.all()
-    filterset_fields = ["status", "date_created"]
+    filterset_fields = ["status", "date_created", "date_effective"]
     search_fields = ["title", "description"]
     ordering_fields = [
         "title",
@@ -62,6 +63,7 @@ class CostItemViewSet(OwnedModelViewSet):
         "cost",
         "quantity",
         "date_created",
+        "date_effective",
         "date_last_modified",
         "created_at",
     ]

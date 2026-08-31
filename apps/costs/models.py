@@ -25,6 +25,7 @@ class CostList(OwnedModel):
     description = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     date_created = models.DateField(default=today)
+    date_effective = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
 
     class Meta(OwnedModel.Meta):
@@ -59,6 +60,7 @@ class CostItem(OwnedModel):
         validators=[MinValueValidator(Decimal("0"))],
     )
     date_created = models.DateField(default=today)
+    date_effective = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
 
     class Meta(OwnedModel.Meta):
