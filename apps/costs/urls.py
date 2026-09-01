@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from .analytics import CostAnalyticsView
+from .receipt_views import BulkCostItemImportView, ReceiptScanView
 from .views import CostItemViewSet, CostListViewSet
 
 
@@ -16,6 +17,16 @@ urlpatterns = router.urls + [
         "costs/analytics/",
         CostAnalyticsView.as_view(),
         name="cost-analytics",
+    ),
+    path(
+        "cost-lists/<int:list_pk>/scan-receipt/",
+        ReceiptScanView.as_view(),
+        name="cost-list-scan-receipt",
+    ),
+    path(
+        "cost-lists/<int:list_pk>/items/bulk/",
+        BulkCostItemImportView.as_view(),
+        name="cost-item-bulk-import",
     ),
     path(
         "cost-lists/<int:list_pk>/items/",

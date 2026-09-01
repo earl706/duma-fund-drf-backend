@@ -56,12 +56,13 @@ class CostItemViewSet(OwnedModelViewSet):
     serializer_class = CostItemSerializer
     queryset = CostItem.objects.all()
     filterset_fields = ["status", "date_created", "date_effective"]
-    search_fields = ["title", "description"]
+    search_fields = ["title"]
     ordering_fields = [
         "title",
         "status",
         "cost",
         "quantity",
+        "unit",
         "date_created",
         "date_effective",
         "date_last_modified",

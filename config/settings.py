@@ -194,6 +194,12 @@ CORS_ALLOW_CREDENTIALS = True
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 
 # -----------------------------------------------------------------------------
+# OpenAI (receipt scan)
+# -----------------------------------------------------------------------------
+OPENAI_API_KEY = env("OPENAI_API_KEY", "")
+OPENAI_RECEIPT_MODEL = env("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
+
+# -----------------------------------------------------------------------------
 # django-allauth (email verification for API registration)
 # -----------------------------------------------------------------------------
 SITE_ID = 1

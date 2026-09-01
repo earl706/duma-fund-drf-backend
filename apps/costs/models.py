@@ -16,6 +16,14 @@ STATUS_CHOICES = [
     ("archived", "Archived"),
 ]
 
+UNIT_CHOICES = [
+    ("pcs", "pcs"),
+    ("kg", "kg"),
+    ("g", "g"),
+    ("L", "L"),
+    ("mL", "mL"),
+]
+
 
 # -----------------------------------------------------------------------------
 # Cost list
@@ -23,6 +31,9 @@ STATUS_CHOICES = [
 class CostList(OwnedModel):
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
+    receipt_image = models.ImageField(
+        upload_to="receipts/%Y/%m/", blank=True, null=True
+    )
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     date_created = models.DateField(default=today)
     date_effective = models.DateField(default=today)
@@ -45,7 +56,6 @@ class CostItem(OwnedModel):
         related_name="items",
     )
     title = models.CharField(max_length=255)
-    description = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     cost = models.DecimalField(
         max_digits=10,
@@ -59,6 +69,7 @@ class CostItem(OwnedModel):
         default=Decimal("1.00"),
         validators=[MinValueValidator(Decimal("0"))],
     )
+    unit = models.CharField(max_length=8, choices=UNIT_CHOICES, default="pcs")
     date_created = models.DateField(default=today)
     date_effective = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
