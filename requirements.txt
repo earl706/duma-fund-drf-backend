@@ -18,4 +18,5 @@ qrcode==8.0
 requests==2.32.3
 django-allauth==65.3.1
 django-anymail[resend]==12.0
+google-genai==1.19.0
 openai==1.59.6

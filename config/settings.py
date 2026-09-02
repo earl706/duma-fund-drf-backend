@@ -193,11 +193,13 @@ CORS_ALLOW_CREDENTIALS = True
 
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 
+# Receipt scan (OpenAI or Gemini)
 # -----------------------------------------------------------------------------
-# OpenAI (receipt scan)
-# -----------------------------------------------------------------------------
+RECEIPT_PROVIDER = env("RECEIPT_PROVIDER", "openai").lower()
 OPENAI_API_KEY = env("OPENAI_API_KEY", "")
 OPENAI_RECEIPT_MODEL = env("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
+GEMINI_API_KEY = env("GEMINI_API_KEY", "")
+GEMINI_RECEIPT_MODEL = env("GEMINI_RECEIPT_MODEL", "gemini-3.6-flash")
 
 # -----------------------------------------------------------------------------
 # django-allauth (email verification for API registration)

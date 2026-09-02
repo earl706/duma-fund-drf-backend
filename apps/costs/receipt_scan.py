@@ -1,4 +1,4 @@
-"""OpenAI vision receipt extraction for CostItem drafts."""
+"""Vision receipt extraction for CostItem drafts (OpenAI or Gemini)."""
 
 import base64
 import json
@@ -118,21 +118,37 @@ def normalize_receipt_payload(raw):
     return {"date_effective": date_effective, "items": items}
 
 
-def scan_receipt_image(file_bytes, mime_type):
-    """Call OpenAI vision and return normalized draft items."""
-    api_key = getattr(settings, "OPENAI_API_KEY", None)
-    if not api_key:
-        raise RuntimeError("OpenAI is not configured (OPENAI_API_KEY missing).")
-
+def _validate_image(file_bytes, mime_type):
     if mime_type not in ALLOWED_MIME:
         raise ValueError("Upload a JPEG, PNG, or WebP receipt image.")
-
     if len(file_bytes) > MAX_RECEIPT_BYTES:
         raise ValueError("Receipt image must be 10 MB or smaller.")
 
+
+def _parse_model_json(content):
+    try:
+        return json.loads(content or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("Could not parse receipt response.") from exc
+
+
+def _resolve_provider():
+    provider = getattr(settings, "RECEIPT_PROVIDER", "openai").lower()
+    if provider not in {"openai", "gemini"}:
+        raise RuntimeError(
+            f"Invalid RECEIPT_PROVIDER '{provider}' (use openai or gemini)."
+        )
+    if provider == "openai" and not getattr(settings, "OPENAI_API_KEY", None):
+        raise RuntimeError("OpenAI is not configured (OPENAI_API_KEY missing).")
+    if provider == "gemini" and not getattr(settings, "GEMINI_API_KEY", None):
+        raise RuntimeError("Gemini is not configured (GEMINI_API_KEY missing).")
+    return provider
+
+
+def _scan_openai(file_bytes, mime_type):
     from openai import OpenAI
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=settings.OPENAI_API_KEY)
     model = getattr(settings, "OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
     b64 = base64.b64encode(file_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
@@ -151,11 +167,50 @@ def scan_receipt_image(file_bytes, mime_type):
         response_format={"type": "json_object"},
         temperature=0,
     )
+    return _parse_model_json(response.choices[0].message.content)
 
-    content = response.choices[0].message.content or "{}"
+
+def _scan_gemini(file_bytes, mime_type):
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import ClientError, ServerError
+
+    client = genai.Client(api_key=settings.GEMINI_API_KEY)
+    model = getattr(settings, "GEMINI_RECEIPT_MODEL", "gemini-3.6-flash")
+
     try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Could not parse receipt response.") from exc
+        response = client.models.generate_content(
+            model=model,
+            contents=[
+                types.Part.from_text(text=RECEIPT_PROMPT),
+                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+            ],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
+    except ClientError as exc:
+        if exc.code == 404:
+            raise ValueError(
+                f"Gemini model '{model}' is not available. "
+                "Set GEMINI_RECEIPT_MODEL=gemini-3.6-flash in your environment."
+            ) from exc
+        raise ValueError(f"Gemini request failed: {exc}") from exc
+    except ServerError as exc:
+        raise RuntimeError("Gemini is temporarily unavailable.") from exc
+
+    return _parse_model_json(response.text)
+
+
+def scan_receipt_image(file_bytes, mime_type):
+    """Call the configured vision provider and return normalized draft items."""
+    _validate_image(file_bytes, mime_type)
+    provider = _resolve_provider()
+
+    if provider == "gemini":
+        parsed = _scan_gemini(file_bytes, mime_type)
+    else:
+        parsed = _scan_openai(file_bytes, mime_type)
 
     return normalize_receipt_payload(parsed)

@@ -1,4 +1,4 @@
-"""Receipt scan (OpenAI) and bulk item import."""
+"""Receipt scan and bulk item import."""
 
 from django.core.files.base import ContentFile
 from django.db import transaction
@@ -24,7 +24,7 @@ def _owned_list(request, list_pk):
 
 
 class ReceiptScanView(APIView):
-    """POST multipart image → OpenAI draft items; stores image on the list."""
+    """POST multipart image → vision provider draft items; stores image on the list."""
 
     permission_classes = [IsAuthenticated, IsEmailVerified]
     parser_classes = [MultiPartParser, FormParser]
