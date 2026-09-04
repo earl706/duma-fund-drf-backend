@@ -40,7 +40,10 @@ def env_list(key, default=""):
 # -----------------------------------------------------------------------------
 # Core security
 # -----------------------------------------------------------------------------
-SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-insecure-change-me")
+SECRET_KEY = env(
+    "DJANGO_SECRET_KEY",
+    "dev-only-insecure-key-change-me-32b-min!!",
+)
 DEBUG = env_bool("DJANGO_DEBUG", True)
 
 # -----------------------------------------------------------------------------
@@ -73,6 +76,7 @@ INSTALLED_APPS = [
     "apps.common",
     "apps.accounts",
     "apps.costs",
+    "apps.finance",
 ]
 
 # -----------------------------------------------------------------------------

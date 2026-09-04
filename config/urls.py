@@ -12,7 +12,7 @@ from .spa import spa_index_response
 # -----------------------------------------------------------------------------
 api_patterns = [
     path("auth/", include("apps.accounts.urls")),
-    path("", include("apps.costs.urls")),
+    path("", include("apps.finance.urls")),
     path("schema/", SpectacularAPIView.as_view(), name="schema"),
     path(
         "docs/",
