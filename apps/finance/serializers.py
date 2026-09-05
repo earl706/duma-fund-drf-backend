@@ -131,7 +131,6 @@ class TransactionItemSerializer(serializers.ModelSerializer):
             "unit",
             "category",
             "date_created",
-            "date_effective",
             "date_last_modified",
             "created_at",
             "updated_at",
@@ -164,7 +163,6 @@ class DraftTransactionItemSerializer(serializers.Serializer):
     )
     unit = serializers.ChoiceField(choices=UNIT_CHOICES, default="pcs")
     category_id = serializers.IntegerField()
-    date_effective = serializers.DateField(required=False)
 
 
 # -----------------------------------------------------------------------------

@@ -144,7 +144,6 @@ class CommitReceiptView(APIView):
                     unit=row.get("unit") or "pcs",
                     category=item_cats[row["category_id"]],
                     date_created=today(),
-                    date_effective=row.get("date_effective") or effective,
                 )
 
             sync_expense_amount(txn)

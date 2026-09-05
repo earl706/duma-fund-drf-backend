@@ -152,7 +152,6 @@ class TransactionItem(OwnedModel):
         related_name="transaction_items",
     )
     date_created = models.DateField(default=today)
-    date_effective = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
 
     class Meta(OwnedModel.Meta):

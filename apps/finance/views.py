@@ -140,7 +140,7 @@ class TransactionViewSet(OwnedModelViewSet):
 class TransactionItemViewSet(OwnedModelViewSet):
     serializer_class = TransactionItemSerializer
     queryset = TransactionItem.objects.all()
-    filterset_fields = ["status", "category", "date_created", "date_effective"]
+    filterset_fields = ["status", "category", "date_created"]
     search_fields = ["title"]
     ordering_fields = [
         "title",
@@ -149,7 +149,6 @@ class TransactionItemViewSet(OwnedModelViewSet):
         "quantity",
         "unit",
         "date_created",
-        "date_effective",
         "date_last_modified",
         "created_at",
     ]

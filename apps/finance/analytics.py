@@ -76,6 +76,7 @@ class FinanceAnalyticsView(APIView):
     GET /api/finance/analytics/?grain=day|week|month&include_archived=0|1&start=&end=
 
     Zero-filled points: period, item_spend, txn_count, txn_spend (expense headers).
+    item_spend and txn_spend both bucket by Transaction.date_effective.
     """
 
     permission_classes = [IsAuthenticated, IsEmailVerified]
@@ -104,7 +105,9 @@ class FinanceAnalyticsView(APIView):
         owner = request.user
 
         items = TransactionItem.objects.filter(
-            owner=owner, date_effective__gte=start, date_effective__lte=end
+            owner=owner,
+            transaction__date_effective__gte=start,
+            transaction__date_effective__lte=end,
         )
         expenses = Transaction.objects.filter(
             owner=owner,
@@ -117,7 +120,7 @@ class FinanceAnalyticsView(APIView):
             expenses = expenses.filter(status="active")
 
         item_rows = (
-            items.annotate(period=trunc("date_effective"))
+            items.annotate(period=trunc("transaction__date_effective"))
             .values("period")
             .annotate(
                 item_spend=Coalesce(
