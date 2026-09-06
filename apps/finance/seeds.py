@@ -64,3 +64,19 @@ def get_default_expense_category(user):
         .order_by("id")
         .first()
     )
+
+
+def get_default_income_category(user):
+    ensure_finance_ready(user)
+    cat = (
+        Category.objects.filter(owner=user, kind="income", name="Other", parent=None)
+        .order_by("id")
+        .first()
+    )
+    if cat:
+        return cat
+    return (
+        Category.objects.filter(owner=user, kind="income", parent=None)
+        .order_by("id")
+        .first()
+    )

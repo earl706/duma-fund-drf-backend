@@ -183,6 +183,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "type",
             "amount",
             "title",
+            "merchant",
             "note",
             "category",
             "receipt_image",
@@ -234,12 +235,64 @@ class TransactionSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class CommitReceiptSerializer(serializers.Serializer):
+class CommitBankEntrySerializer(serializers.Serializer):
+    txn_type = serializers.ChoiceField(
+        choices=["income", "transfer_in", "transfer_out"]
+    )
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
     title = serializers.CharField(max_length=255, allow_blank=True, required=False)
+    merchant = serializers.CharField(max_length=255, allow_blank=True, required=False)
     note = serializers.CharField(allow_blank=True, required=False, default="")
-    category_id = serializers.IntegerField()
+    date_effective = serializers.DateField(required=False, allow_null=True)
+    category_id = serializers.IntegerField(required=False, allow_null=True)
+
+    def validate(self, attrs):
+        txn_type = attrs.get("txn_type")
+        if txn_type == "income" and not attrs.get("category_id"):
+            raise ValidationError(
+                {"category_id": "Income entries require an income category."}
+            )
+        if txn_type in ("transfer_in", "transfer_out"):
+            attrs.pop("category_id", None)
+        if not attrs.get("date_effective"):
+            attrs.pop("date_effective", None)
+        return attrs
+
+
+class CommitReceiptSerializer(serializers.Serializer):
+    document_kind = serializers.ChoiceField(
+        choices=["retail_receipt", "bank_slip"],
+        default="retail_receipt",
+        required=False,
+    )
+    title = serializers.CharField(max_length=255, allow_blank=True, required=False)
+    merchant = serializers.CharField(max_length=255, allow_blank=True, required=False)
+    note = serializers.CharField(allow_blank=True, required=False, default="")
+    category_id = serializers.IntegerField(required=False, allow_null=True)
     date_effective = serializers.DateField(required=False)
-    items = DraftTransactionItemSerializer(many=True, allow_empty=False)
+    items = DraftTransactionItemSerializer(many=True, required=False, allow_empty=True)
+    entries = CommitBankEntrySerializer(many=True, required=False, allow_empty=True)
+
+    def validate(self, attrs):
+        kind = attrs.get("document_kind") or "retail_receipt"
+        attrs["document_kind"] = kind
+        if kind == "retail_receipt":
+            if not attrs.get("category_id"):
+                raise ValidationError(
+                    {"category_id": "Category is required for retail receipts."}
+                )
+            if not attrs.get("items"):
+                raise ValidationError(
+                    {"items": "At least one line item is required for retail receipts."}
+                )
+        else:
+            if not attrs.get("entries"):
+                raise ValidationError(
+                    {"entries": "At least one bank entry is required."}
+                )
+        return attrs
 
 
 # -----------------------------------------------------------------------------

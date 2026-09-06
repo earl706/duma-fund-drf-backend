@@ -1,8 +1,15 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from .analytics import FinanceAnalyticsView
+from .analytics import FinanceAnalyticsView, FinanceBreakdownView
 from .balance import BalanceView
+from .purchases import (
+    PurchaseExcludeView,
+    PurchaseInsightsView,
+    PurchaseLookupView,
+    PurchaseMarkRegularView,
+    PurchaseNotificationsView,
+)
 from .receipt_views import CommitReceiptView, ReceiptScanView
 from .views import CategoryViewSet, TransactionItemViewSet, TransactionViewSet
 
@@ -24,6 +31,36 @@ urlpatterns = [
         "finance/analytics/",
         FinanceAnalyticsView.as_view(),
         name="finance-analytics",
+    ),
+    path(
+        "finance/analytics/breakdown/",
+        FinanceBreakdownView.as_view(),
+        name="finance-analytics-breakdown",
+    ),
+    path(
+        "finance/purchases/lookup/",
+        PurchaseLookupView.as_view(),
+        name="finance-purchase-lookup",
+    ),
+    path(
+        "finance/purchases/insights/",
+        PurchaseInsightsView.as_view(),
+        name="finance-purchase-insights",
+    ),
+    path(
+        "finance/purchases/notifications/",
+        PurchaseNotificationsView.as_view(),
+        name="finance-purchase-notifications",
+    ),
+    path(
+        "finance/purchases/mark-regular/",
+        PurchaseMarkRegularView.as_view(),
+        name="finance-purchase-mark-regular",
+    ),
+    path(
+        "finance/purchases/exclude/",
+        PurchaseExcludeView.as_view(),
+        name="finance-purchase-exclude",
     ),
     path(
         "finance/transactions/scan-receipt/",

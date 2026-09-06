@@ -99,6 +99,7 @@ class Transaction(OwnedModel):
         validators=[MinValueValidator(Decimal("0"))],
     )
     title = models.CharField(max_length=255, blank=True)
+    merchant = models.CharField(max_length=255, blank=True, default="")
     note = models.TextField(blank=True)
     category = models.ForeignKey(
         Category,
@@ -169,3 +170,42 @@ class TransactionItem(OwnedModel):
         transaction = self.transaction
         super().delete(*args, **kwargs)
         transaction.save()
+
+
+# -----------------------------------------------------------------------------
+# Recurring purchase preferences (manual regular + exclusions)
+# -----------------------------------------------------------------------------
+class PurchaseRegularMark(OwnedModel):
+    """User-pinned staple; family_key from purchase_match.family_key(title)."""
+
+    family_key = models.CharField(max_length=255, db_index=True)
+    display_title = models.CharField(max_length=255)
+
+    class Meta(OwnedModel.Meta):
+        constraints = [
+            models.UniqueConstraint(
+                fields=["owner", "family_key"],
+                name="finance_purchase_regular_unique_owner_key",
+            )
+        ]
+
+    def __str__(self):
+        return f"regular:{self.display_title}"
+
+
+class PurchaseExclusion(OwnedModel):
+    """Bidirectional 'not the same product' pair (key_a <= key_b)."""
+
+    key_a = models.CharField(max_length=255, db_index=True)
+    key_b = models.CharField(max_length=255, db_index=True)
+
+    class Meta(OwnedModel.Meta):
+        constraints = [
+            models.UniqueConstraint(
+                fields=["owner", "key_a", "key_b"],
+                name="finance_purchase_exclusion_unique_pair",
+            )
+        ]
+
+    def __str__(self):
+        return f"exclude:{self.key_a}|{self.key_b}"

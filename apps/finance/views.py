@@ -100,7 +100,7 @@ class TransactionViewSet(OwnedModelViewSet):
     serializer_class = TransactionSerializer
     queryset = Transaction.objects.all()
     filterset_fields = ["type", "status", "category", "date_effective", "date_created"]
-    search_fields = ["title", "note"]
+    search_fields = ["title", "note", "merchant"]
     ordering_fields = [
         "title",
         "type",
