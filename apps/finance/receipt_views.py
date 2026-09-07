@@ -40,8 +40,21 @@ class ReceiptScanView(APIView):
         file_bytes = upload.read()
         mime_type = upload.content_type or "image/jpeg"
 
+        llm_override = None
+        provider = (request.data.get("llm_provider") or "").strip().lower()
+        api_key = (request.data.get("llm_api_key") or "").strip()
+        model = (request.data.get("llm_model") or "").strip()
+        if provider or api_key or model:
+            llm_override = {
+                "provider": provider or None,
+                "api_key": api_key or None,
+                "model": model or None,
+            }
+
         try:
-            draft = scan_receipt_image(file_bytes, mime_type, request.user)
+            draft = scan_receipt_image(
+                file_bytes, mime_type, request.user, llm_override=llm_override
+            )
         except RuntimeError as exc:
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE

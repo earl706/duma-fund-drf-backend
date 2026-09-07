@@ -125,14 +125,46 @@ Bank / transfer rules:
 
 
 def _quantize_decimal(value, places=2):
+    if value is None or value == "":
+        return None
+    text = str(value).strip()
+    text = re.sub(r"(?i)\b(?:php|usd|eur|sgd)\b", "", text)
+    text = re.sub(r"[₱$€£¥]", "", text).strip()
+    text = text.replace(",", "")
     try:
-        d = Decimal(str(value))
+        d = Decimal(text)
     except (InvalidOperation, TypeError, ValueError):
         return None
     if d < 0:
         return None
     quant = Decimal("1") if places == 0 else Decimal("0." + "0" * (places - 1) + "1")
     return str(d.quantize(quant))
+
+
+def _item_title(entry):
+    for key in ("title", "name", "description", "product", "item"):
+        title = str(entry.get(key) or "").strip()
+        if title:
+            return title[:255]
+    return ""
+
+
+def _item_cost(entry):
+    for key in ("cost", "unit_price", "price", "amount"):
+        if entry.get(key) is not None and entry.get(key) != "":
+            cost = _quantize_decimal(entry.get(key))
+            if cost is not None:
+                return cost
+    return None
+
+
+def _item_quantity(entry):
+    for key in ("quantity", "qty", "count"):
+        if entry.get(key) is not None and entry.get(key) != "":
+            quantity = _quantize_decimal(entry.get(key))
+            if quantity is not None:
+                return quantity
+    return "1.00"
 
 
 def _normalize_unit(value):
@@ -252,7 +284,13 @@ def normalize_retail_payload(raw, categories, fallback_category_id):
         raw.get("category_id"), valid_ids, fallback_category_id
     )
 
-    items_in = raw.get("items") or []
+    items_in = (
+        raw.get("items")
+        or raw.get("line_items")
+        or raw.get("products")
+        or raw.get("lines")
+        or []
+    )
     if not isinstance(items_in, list):
         raise ValueError("Receipt items must be a list.")
 
@@ -260,16 +298,16 @@ def normalize_retail_payload(raw, categories, fallback_category_id):
     for entry in items_in:
         if not isinstance(entry, dict):
             continue
-        title = str(entry.get("title") or "").strip()
+        title = _item_title(entry)
         if not title:
             continue
-        cost = _quantize_decimal(entry.get("cost"))
-        quantity = _quantize_decimal(entry.get("quantity"))
+        cost = _item_cost(entry)
+        quantity = _item_quantity(entry)
         if cost is None or quantity is None:
             continue
         items.append(
             {
-                "title": title[:255],
+                "title": title,
                 "cost": cost,
                 "quantity": quantity,
                 "unit": _normalize_unit(entry.get("unit")),
@@ -378,30 +416,69 @@ def _validate_image(file_bytes, mime_type):
 
 
 def _parse_model_json(content):
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("Could not parse receipt response.")
+
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+
     try:
-        return json.loads(content or "{}")
+        return json.loads(text)
     except json.JSONDecodeError as exc:
         raise ValueError("Could not parse receipt response.") from exc
 
 
-def _resolve_provider():
-    provider = getattr(settings, "RECEIPT_PROVIDER", "openai").lower()
+def _resolve_provider(override=None):
+    override = override or {}
+    provider = (
+        str(override.get("provider") or getattr(settings, "RECEIPT_PROVIDER", "openai"))
+        .strip()
+        .lower()
+    )
     if provider not in {"openai", "gemini"}:
         raise RuntimeError(
             f"Invalid RECEIPT_PROVIDER '{provider}' (use openai or gemini)."
         )
-    if provider == "openai" and not getattr(settings, "OPENAI_API_KEY", None):
-        raise RuntimeError("OpenAI is not configured (OPENAI_API_KEY missing).")
-    if provider == "gemini" and not getattr(settings, "GEMINI_API_KEY", None):
-        raise RuntimeError("Gemini is not configured (GEMINI_API_KEY missing).")
-    return provider
+
+    api_key = (override.get("api_key") or "").strip()
+    if provider == "openai":
+        if not api_key:
+            api_key = getattr(settings, "OPENAI_API_KEY", "") or ""
+        if not api_key:
+            raise RuntimeError(
+                "OpenAI is not configured. Add an API key in Settings or set OPENAI_API_KEY."
+            )
+    else:
+        if not api_key:
+            api_key = getattr(settings, "GEMINI_API_KEY", "") or ""
+        if not api_key:
+            raise RuntimeError(
+                "Gemini is not configured. Add an API key in Settings or set GEMINI_API_KEY."
+            )
+
+    if provider == "openai":
+        model = (override.get("model") or "").strip() or getattr(
+            settings, "OPENAI_RECEIPT_MODEL", "gpt-4o-mini"
+        )
+    else:
+        model = (override.get("model") or "").strip() or getattr(
+            settings, "GEMINI_RECEIPT_MODEL", "gemini-3.5-flash"
+        )
+
+    return provider, api_key, model
 
 
-def _scan_openai(file_bytes, mime_type, prompt):
+def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
     from openai import OpenAI
 
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    model = getattr(settings, "OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
+    client = OpenAI(api_key=api_key)
     b64 = base64.b64encode(file_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
 
@@ -422,40 +499,79 @@ def _scan_openai(file_bytes, mime_type, prompt):
     return _parse_model_json(response.choices[0].message.content)
 
 
-def _scan_gemini(file_bytes, mime_type, prompt):
+# Prefer current Flash IDs; keep older aliases as last resorts.
+GEMINI_MODEL_FALLBACKS = (
+    "gemini-3.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+)
+
+
+def _gemini_model_candidates(preferred):
+    preferred = (preferred or "").strip()
+    ordered = []
+    if preferred:
+        ordered.append(preferred)
+    for model in GEMINI_MODEL_FALLBACKS:
+        if model not in ordered:
+            ordered.append(model)
+    return ordered
+
+
+def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
+    import time
+
     from google import genai
     from google.genai import types
     from google.genai.errors import ClientError, ServerError
 
-    client = genai.Client(api_key=settings.GEMINI_API_KEY)
-    model = getattr(settings, "GEMINI_RECEIPT_MODEL", "gemini-3.6-flash")
+    client = genai.Client(api_key=api_key)
+    contents = [
+        types.Part.from_text(text=prompt),
+        types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+    ]
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        temperature=0,
+    )
 
-    try:
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                types.Part.from_text(text=prompt),
-                types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-            ],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0,
-            ),
+    last_server_error = None
+    last_missing = None
+    for candidate in _gemini_model_candidates(model):
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=candidate,
+                    contents=contents,
+                    config=config,
+                )
+                return _parse_model_json(response.text)
+            except ClientError as exc:
+                if exc.code == 404:
+                    last_missing = candidate
+                    break  # try next model
+                raise ValueError(f"Gemini request failed: {exc}") from exc
+            except ServerError as exc:
+                last_server_error = (candidate, exc)
+                if attempt == 0:
+                    time.sleep(0.8)
+                    continue
+                break  # try next model
+
+    if last_missing and not last_server_error:
+        raise ValueError(
+            f"Gemini model '{model}' is not available. "
+            "Try gemini-3.5-flash in Settings or GEMINI_RECEIPT_MODEL."
         )
-    except ClientError as exc:
-        if exc.code == 404:
-            raise ValueError(
-                f"Gemini model '{model}' is not available. "
-                "Set GEMINI_RECEIPT_MODEL=gemini-3.6-flash in your environment."
-            ) from exc
-        raise ValueError(f"Gemini request failed: {exc}") from exc
-    except ServerError as exc:
-        raise RuntimeError("Gemini is temporarily unavailable.") from exc
-
-    return _parse_model_json(response.text)
+    failed_model = last_server_error[0] if last_server_error else model
+    raise RuntimeError(
+        f"Gemini is temporarily unavailable (model '{failed_model}' returned 503). "
+        "Retry shortly, or switch model in Settings (e.g. gemini-3.5-flash)."
+    )
 
 
-def scan_receipt_image(file_bytes, mime_type, user):
+def scan_receipt_image(file_bytes, mime_type, user, llm_override=None):
     """Call vision provider; return normalized draft (retail or bank)."""
     _validate_image(file_bytes, mime_type)
     ensure_finance_ready(user)
@@ -478,12 +594,12 @@ def scan_receipt_image(file_bytes, mime_type, user):
     prompt = build_receipt_prompt(
         expense_categories, income_categories, account_holder_name
     )
-    provider = _resolve_provider()
+    provider, api_key, model = _resolve_provider(llm_override)
 
     if provider == "gemini":
-        parsed = _scan_gemini(file_bytes, mime_type, prompt)
+        parsed = _scan_gemini(file_bytes, mime_type, prompt, api_key, model)
     else:
-        parsed = _scan_openai(file_bytes, mime_type, prompt)
+        parsed = _scan_openai(file_bytes, mime_type, prompt, api_key, model)
 
     return normalize_receipt_payload(
         parsed,
