@@ -19,6 +19,7 @@ from .receipt_scan import scan_receipt_image
 from .serializers import (
     CommitReceiptSerializer,
     TransactionSerializer,
+    apply_expense_categories,
     sync_expense_amount,
 )
 from .seeds import ensure_finance_ready
@@ -68,8 +69,8 @@ class ReceiptScanView(APIView):
 class CommitReceiptView(APIView):
     """
     POST multipart:
-      retail_receipt — image + title, note, category_id, date_effective, items
-        → expense Transaction + TransactionItems
+      retail_receipt — image + title, note, category_id / category_ids, date_effective, items
+        → expense Transaction + TransactionItems (categories on header only)
       bank_slip — image + entries (JSON) → one or more income/transfer Transactions
     """
 
@@ -122,6 +123,16 @@ class CommitReceiptView(APIView):
         category_id = request.data.get("category_id")
         if category_id not in ("", None):
             data["category_id"] = category_id
+        category_ids_raw = request.data.get("category_ids")
+        if isinstance(category_ids_raw, str):
+            try:
+                category_ids = json.loads(category_ids_raw) if category_ids_raw else None
+            except json.JSONDecodeError as exc:
+                raise ValidationError({"category_ids": "Invalid JSON."}) from exc
+        else:
+            category_ids = category_ids_raw
+        if isinstance(category_ids, list) and category_ids:
+            data["category_ids"] = category_ids
         date_effective = request.data.get("date_effective")
         if date_effective:
             data["date_effective"] = date_effective
@@ -159,31 +170,27 @@ class CommitReceiptView(APIView):
             txn.receipt_image.save(image_name, ContentFile(image_bytes), save=True)
 
     def _serialize_txn(self, txn_id, request):
-        qs = annotate_transaction_amount(
-            Transaction.objects.filter(pk=txn_id)
-        ).select_related("category")
+        qs = (
+            annotate_transaction_amount(Transaction.objects.filter(pk=txn_id))
+            .select_related("category")
+            .prefetch_related("categories")
+        )
         return TransactionSerializer(qs.get(), context={"request": request}).data
 
     def _commit_retail(self, owner, payload, image_bytes, image_name, request):
-        try:
-            header_cat = Category.objects.get(
-                pk=payload["category_id"], owner=owner, kind="expense"
+        category_ids = payload["category_ids"]
+        cats = {
+            c.id: c
+            for c in Category.objects.filter(
+                owner=owner, kind="expense", pk__in=category_ids
             )
-        except Category.DoesNotExist as exc:
-            raise ValidationError({"category_id": "Invalid expense category."}) from exc
-
-        item_cats = {}
-        for row in payload["items"]:
-            cid = row["category_id"]
-            if cid not in item_cats:
-                try:
-                    item_cats[cid] = Category.objects.get(
-                        pk=cid, owner=owner, kind="expense"
-                    )
-                except Category.DoesNotExist as exc:
-                    raise ValidationError(
-                        {"items": f"Invalid category_id {cid}."}
-                    ) from exc
+        }
+        missing = [cid for cid in category_ids if cid not in cats]
+        if missing:
+            raise ValidationError(
+                {"category_ids": f"Invalid expense category id(s): {missing}."}
+            )
+        header_cat = cats[category_ids[0]]
 
         effective = payload.get("date_effective") or today()
         merchant = (payload.get("merchant") or payload.get("title") or "").strip()
@@ -202,6 +209,7 @@ class CommitReceiptView(APIView):
                 date_created=today(),
                 date_effective=effective,
             )
+            apply_expense_categories(txn, category_ids, owner=owner)
             self._attach_image(txn, image_bytes, image_name)
 
             for row in payload["items"]:
@@ -212,7 +220,6 @@ class CommitReceiptView(APIView):
                     cost=row["cost"],
                     quantity=row["quantity"],
                     unit=row.get("unit") or "pcs",
-                    category=item_cats[row["category_id"]],
                     date_created=today(),
                 )
 

@@ -203,7 +203,8 @@ class FinanceBreakdownView(APIView):
     GET /api/finance/analytics/breakdown/?period=day|week|month&include_archived=0|1
 
     Current calendar period (today / this week Mon–today / this month 1st–today):
-      categories — top 5 line-item categories + Other
+      categories — top 5 expense header categories + Other
+        (full transaction amount counted in every selected category)
       balance_composition — starting_balance vs period expense spend
     """
 
@@ -226,12 +227,6 @@ class FinanceBreakdownView(APIView):
         start, end = _current_period_bounds(period, today)
         owner = request.user
 
-        items = TransactionItem.objects.filter(
-            owner=owner,
-            transaction__type="expense",
-            transaction__date_effective__gte=start,
-            transaction__date_effective__lte=end,
-        )
         expenses = Transaction.objects.filter(
             owner=owner,
             type="expense",
@@ -239,14 +234,19 @@ class FinanceBreakdownView(APIView):
             date_effective__lte=end,
         )
         if not include_archived:
-            items = items.filter(status="active", transaction__status="active")
             expenses = expenses.filter(status="active")
 
+        # Join M2M so each tagged category gets the full header amount.
         cat_rows = (
-            items.values("category_id", "category__name", "category__parent_id")
+            expenses.filter(categories__isnull=False)
+            .values(
+                "categories__id",
+                "categories__name",
+                "categories__parent_id",
+            )
             .annotate(
                 amount=Coalesce(
-                    Sum(ITEM_LINE),
+                    Sum("amount"),
                     Value(Decimal("0.00")),
                     output_field=DecimalField(max_digits=14, decimal_places=2),
                 )
@@ -254,9 +254,37 @@ class FinanceBreakdownView(APIView):
             .order_by("-amount")
         )
 
-        parent_ids = {
-            row["category__parent_id"] for row in cat_rows if row["category__parent_id"]
-        }
+        # Expenses that only have primary FK (no M2M yet) still contribute.
+        primary_only = (
+            expenses.filter(categories__isnull=True, category__isnull=False)
+            .values("category_id", "category__name", "category__parent_id")
+            .annotate(
+                amount=Coalesce(
+                    Sum("amount"),
+                    Value(Decimal("0.00")),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                )
+            )
+        )
+
+        totals = {}
+        meta = {}
+        for row in cat_rows:
+            cid = row["categories__id"]
+            if cid is None:
+                continue
+            amount = row["amount"] or Decimal("0.00")
+            totals[cid] = totals.get(cid, Decimal("0.00")) + amount
+            meta[cid] = (row["categories__name"], row["categories__parent_id"])
+        for row in primary_only:
+            cid = row["category_id"]
+            if cid is None:
+                continue
+            amount = row["amount"] or Decimal("0.00")
+            totals[cid] = totals.get(cid, Decimal("0.00")) + amount
+            meta[cid] = (row["category__name"], row["category__parent_id"])
+
+        parent_ids = {parent for _, parent in meta.values() if parent}
         parents = {
             c.id: c.name
             for c in Category.objects.filter(owner=owner, id__in=parent_ids).only(
@@ -265,21 +293,15 @@ class FinanceBreakdownView(APIView):
         }
 
         ranked = []
-        for row in cat_rows:
-            amount = row["amount"] or Decimal("0.00")
+        for cid, amount in totals.items():
             if amount <= 0:
                 continue
-            name = row["category__name"] or "Uncategorized"
-            parent_id = row["category__parent_id"]
+            name, parent_id = meta.get(cid, ("Uncategorized", None))
+            name = name or "Uncategorized"
             if parent_id and parent_id in parents:
                 name = f"{parents[parent_id]} › {name}"
-            ranked.append(
-                {
-                    "id": row["category_id"],
-                    "name": name,
-                    "amount": amount,
-                }
-            )
+            ranked.append({"id": cid, "name": name, "amount": amount})
+        ranked.sort(key=lambda r: r["amount"], reverse=True)
 
         top = ranked[:TOP_CATEGORY_SLICES]
         rest = ranked[TOP_CATEGORY_SLICES:]
@@ -301,7 +323,8 @@ class FinanceBreakdownView(APIView):
                 }
             )
 
-        item_spend = sum((r["amount"] for r in ranked), Decimal("0.00"))
+        # Sum of pie slices may exceed spent when txns have multiple tags.
+        tagged_spend = sum((r["amount"] for r in ranked), Decimal("0.00"))
         spent = expenses.aggregate(
             total=Coalesce(
                 Sum("amount"),
@@ -320,7 +343,7 @@ class FinanceBreakdownView(APIView):
                 "end": end.isoformat(),
                 "include_archived": include_archived,
                 "categories": categories,
-                "item_spend": _dec_str(item_spend),
+                "item_spend": _dec_str(tagged_spend),
                 "balance_composition": {
                     "starting_balance": _dec_str(starting),
                     "spent": _dec_str(spent),

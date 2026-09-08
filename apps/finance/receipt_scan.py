@@ -7,7 +7,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.conf import settings
 
-from .models import Category, UNIT_CHOICES
+from .models import MAX_EXPENSE_CATEGORIES, Category, UNIT_CHOICES
 from .seeds import (
     ensure_finance_ready,
     get_default_expense_category,
@@ -54,14 +54,14 @@ If retail_receipt:
   "document_kind": "retail_receipt",
   "merchant": "store name or null",
   "date_effective": "YYYY-MM-DD or null",
-  "category_id": <expense category id for the whole receipt>,
+  "category_id": <expense category id for the whole receipt (primary)>,
   "items": [
     {{
       "title": "product name",
       "cost": "7.00",
       "quantity": "12",
       "unit": "pcs",
-      "category_id": <best matching expense category id>
+      "category_id": <best matching expense category id (rolled up to receipt)>
     }}
   ]
 }}
@@ -99,6 +99,7 @@ Retail rules:
 - Skip subtotals, tax, payment, change, headers, and non-product lines
 - Use decimal strings; cost with 2 decimal places
 - Pick the closest category_id for the receipt and each line from the expense list
+  (line categories are suggestions; they will be merged onto the receipt header)
 - merchant = store / vendor name printed on the receipt
 
 Bank / transfer rules:
@@ -295,6 +296,10 @@ def normalize_retail_payload(raw, categories, fallback_category_id):
         raise ValueError("Receipt items must be a list.")
 
     items = []
+    rolled_category_ids = []
+    if header_category_id:
+        rolled_category_ids.append(header_category_id)
+
     for entry in items_in:
         if not isinstance(entry, dict):
             continue
@@ -305,26 +310,33 @@ def normalize_retail_payload(raw, categories, fallback_category_id):
         quantity = _item_quantity(entry)
         if cost is None or quantity is None:
             continue
+        line_cat = _resolve_category_id(
+            entry.get("category_id"), valid_ids, header_category_id
+        )
+        if line_cat and line_cat not in rolled_category_ids:
+            if len(rolled_category_ids) < MAX_EXPENSE_CATEGORIES:
+                rolled_category_ids.append(line_cat)
         items.append(
             {
                 "title": title,
                 "cost": cost,
                 "quantity": quantity,
                 "unit": _normalize_unit(entry.get("unit")),
-                "category_id": _resolve_category_id(
-                    entry.get("category_id"), valid_ids, header_category_id
-                ),
             }
         )
 
     if not items:
         raise ValueError("No line items could be extracted from the receipt.")
 
+    if not rolled_category_ids and header_category_id:
+        rolled_category_ids = [header_category_id]
+
     return {
         "document_kind": "retail_receipt",
         "merchant": merchant,
         "date_effective": date_effective,
-        "category_id": header_category_id,
+        "category_id": rolled_category_ids[0] if rolled_category_ids else header_category_id,
+        "category_ids": rolled_category_ids,
         "items": items,
     }
 

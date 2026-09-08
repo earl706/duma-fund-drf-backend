@@ -1,8 +1,5 @@
-from decimal import Decimal
-
 from django.db import transaction as db_transaction
-from django.db.models import Count, DecimalField, ExpressionWrapper, F, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Count, Q
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
@@ -18,14 +15,37 @@ from .serializers import (
     TransactionItemSerializer,
     TransactionSerializer,
     annotate_transaction_amount,
+    apply_expense_categories,
     sync_expense_amount,
 )
 
 
-LINE_TOTAL_ANN = ExpressionWrapper(
-    F("items__cost") * F("items__quantity"),
-    output_field=DecimalField(max_digits=14, decimal_places=2),
-)
+def _unlink_or_reassign_category(category, target, owner):
+    """
+    Remove category from expense M2M tags when other labels remain.
+    Reassign to target when it is the sole / primary-only category.
+    Income keeps a single FK → always reassign.
+    """
+    # Income / transfer headers using the FK as primary
+    Transaction.objects.filter(category=category, type="income").update(category=target)
+
+    expense_qs = (
+        Transaction.objects.filter(owner=owner, type="expense")
+        .filter(Q(category=category) | Q(categories=category))
+        .distinct()
+    )
+
+    for txn in expense_qs:
+        tag_ids = list(txn.categories.values_list("id", flat=True))
+        if category.id not in tag_ids and txn.category_id:
+            tag_ids = [txn.category_id] + [i for i in tag_ids if i != txn.category_id]
+        if category.id not in tag_ids:
+            continue
+        remaining = [i for i in tag_ids if i != category.id]
+        if remaining:
+            apply_expense_categories(txn, remaining, owner=owner)
+        else:
+            apply_expense_categories(txn, [target.id], owner=owner)
 
 
 # -----------------------------------------------------------------------------
@@ -66,9 +86,7 @@ class CategoryViewSet(OwnedModelViewSet):
             )
 
         with db_transaction.atomic():
-            Transaction.objects.filter(category=category).update(category=target)
-            TransactionItem.objects.filter(category=category).update(category=target)
-            # Re-parent children onto target (or keep as roots under same kind)
+            _unlink_or_reassign_category(category, target, request.user)
             Category.objects.filter(parent=category).update(parent=target)
             category.delete()
 
@@ -76,21 +94,54 @@ class CategoryViewSet(OwnedModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         category = self.get_object()
-        in_use = (
-            Transaction.objects.filter(category=category).exists()
-            or TransactionItem.objects.filter(category=category).exists()
-            or category.children.exists()
-        )
-        if in_use:
+        # Sole-category expenses or income headers still need reassign.
+        sole_expense = False
+        for txn in (
+            Transaction.objects.filter(owner=request.user, type="expense")
+            .filter(Q(category=category) | Q(categories=category))
+            .distinct()
+            .prefetch_related("categories")
+        ):
+            tag_ids = set(txn.categories.values_list("id", flat=True))
+            if not tag_ids and txn.category_id:
+                tag_ids = {txn.category_id}
+            if tag_ids == {category.id}:
+                sole_expense = True
+                break
+
+        income_in_use = Transaction.objects.filter(
+            category=category, type="income"
+        ).exists()
+        has_children = category.children.exists()
+
+        if sole_expense or income_in_use or has_children:
             raise ValidationError(
                 {
                     "detail": (
-                        "Category is in use. Use reassign-and-delete with a "
-                        "target_category_id."
+                        "Category is in use as the only label (or has children). "
+                        "Use reassign-and-delete with a target_category_id."
                     )
                 }
             )
-        return super().destroy(request, *args, **kwargs)
+
+        with db_transaction.atomic():
+            # Multi-tagged expenses: drop this link only; promote another primary.
+            for txn in (
+                Transaction.objects.filter(owner=request.user, type="expense")
+                .filter(Q(category=category) | Q(categories=category))
+                .distinct()
+            ):
+                tag_ids = list(txn.categories.values_list("id", flat=True))
+                if category.id not in tag_ids and txn.category_id == category.id:
+                    tag_ids = [txn.category_id] + [
+                        i for i in tag_ids if i != txn.category_id
+                    ]
+                remaining = [i for i in tag_ids if i != category.id]
+                if remaining:
+                    apply_expense_categories(txn, remaining, owner=request.user)
+            category.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 # -----------------------------------------------------------------------------
@@ -99,7 +150,7 @@ class CategoryViewSet(OwnedModelViewSet):
 class TransactionViewSet(OwnedModelViewSet):
     serializer_class = TransactionSerializer
     queryset = Transaction.objects.all()
-    filterset_fields = ["type", "status", "category", "date_effective", "date_created"]
+    filterset_fields = ["type", "status", "date_effective", "date_created"]
     search_fields = ["title", "note", "merchant"]
     ordering_fields = [
         "title",
@@ -115,11 +166,18 @@ class TransactionViewSet(OwnedModelViewSet):
 
     def get_queryset(self):
         ensure_finance_ready(self.request.user)
-        return (
+        qs = (
             annotate_transaction_amount(super().get_queryset())
-            .annotate(item_count=Count("items"))
+            .annotate(item_count=Count("items", distinct=True))
             .select_related("category")
+            .prefetch_related("categories")
         )
+        category = self.request.query_params.get("category")
+        if category not in (None, ""):
+            qs = qs.filter(
+                Q(category_id=category) | Q(categories__id=category)
+            ).distinct()
+        return qs
 
     def perform_create(self, serializer):
         ensure_finance_ready(self.request.user)
@@ -140,7 +198,7 @@ class TransactionViewSet(OwnedModelViewSet):
 class TransactionItemViewSet(OwnedModelViewSet):
     serializer_class = TransactionItemSerializer
     queryset = TransactionItem.objects.all()
-    filterset_fields = ["status", "category", "date_created"]
+    filterset_fields = ["status", "date_created"]
     search_fields = ["title"]
     ordering_fields = [
         "title",
@@ -163,7 +221,7 @@ class TransactionItemViewSet(OwnedModelViewSet):
 
     def get_queryset(self):
         txn = self._owned_transaction()
-        return super().get_queryset().filter(transaction=txn).select_related("category")
+        return super().get_queryset().filter(transaction=txn)
 
     def perform_create(self, serializer):
         txn = self._owned_transaction()

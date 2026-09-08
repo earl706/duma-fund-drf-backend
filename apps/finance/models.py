@@ -37,6 +37,9 @@ TRANSACTION_TYPE_CHOICES = [
     ("transfer_out", "Transfer out"),
 ]
 
+# Expense headers may carry multiple unordered category labels (incl. primary).
+MAX_EXPENSE_CATEGORIES = 5
+
 
 # -----------------------------------------------------------------------------
 # Per-user finance settings (starting balance)
@@ -101,12 +104,19 @@ class Transaction(OwnedModel):
     title = models.CharField(max_length=255, blank=True)
     merchant = models.CharField(max_length=255, blank=True, default="")
     note = models.TextField(blank=True)
+    # Primary category: required for income/expense; null for transfers.
+    # For expenses, also mirrored in `categories` (M2M, max MAX_EXPENSE_CATEGORIES).
     category = models.ForeignKey(
         Category,
         on_delete=models.PROTECT,
         null=True,
         blank=True,
         related_name="transactions",
+    )
+    categories = models.ManyToManyField(
+        Category,
+        blank=True,
+        related_name="tagged_transactions",
     )
     receipt_image = models.ImageField(
         upload_to="receipts/%Y/%m/", blank=True, null=True
@@ -147,11 +157,6 @@ class TransactionItem(OwnedModel):
         validators=[MinValueValidator(Decimal("0"))],
     )
     unit = models.CharField(max_length=8, choices=UNIT_CHOICES, default="pcs")
-    category = models.ForeignKey(
-        Category,
-        on_delete=models.PROTECT,
-        related_name="transaction_items",
-    )
     date_created = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
 

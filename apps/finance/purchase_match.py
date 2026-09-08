@@ -169,7 +169,7 @@ def iter_purchase_events(owner) -> list[PurchaseEvent]:
                 date_effective=txn.date_effective,
                 transaction_id=txn.id,
                 item_id=item.id,
-                category_id=item.category_id,
+                category_id=txn.category_id,
                 is_header_only=False,
             )
         )

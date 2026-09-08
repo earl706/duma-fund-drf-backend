@@ -6,6 +6,7 @@ from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
 from .models import (
+    MAX_EXPENSE_CATEGORIES,
     UNIT_CHOICES,
     Category,
     Transaction,
@@ -51,6 +52,68 @@ def sync_expense_amount(txn):
             Transaction.objects.filter(pk=txn.pk).update(amount=total)
             txn.amount = total
     return txn
+
+
+def _ordered_unique_ids(ids):
+    ordered = []
+    seen = set()
+    for raw in ids:
+        if raw is None or raw == "":
+            continue
+        cid = int(raw)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        ordered.append(cid)
+    return ordered
+
+
+def resolve_expense_category_ids(primary_id, category_ids):
+    """
+    Build ordered expense category id list (primary first), capped at MAX.
+    `category_ids` may be None (omit → primary only) or a list.
+    """
+    if category_ids is None:
+        if primary_id is None:
+            return []
+        return [int(primary_id)]
+
+    ordered = _ordered_unique_ids(category_ids)
+    if primary_id is not None:
+        pid = int(primary_id)
+        ordered = [pid] + [c for c in ordered if c != pid]
+    if len(ordered) > MAX_EXPENSE_CATEGORIES:
+        raise ValidationError(
+            {
+                "categories": (
+                    f"At most {MAX_EXPENSE_CATEGORIES} categories allowed on an expense."
+                )
+            }
+        )
+    return ordered
+
+
+def apply_expense_categories(txn, category_ids, *, owner):
+    """Validate expense Category rows and set primary FK + M2M tags."""
+    if not category_ids:
+        raise ValidationError(
+            {"categories": "At least one expense category is required."}
+        )
+    cats = list(
+        Category.objects.filter(owner=owner, kind="expense", pk__in=category_ids)
+    )
+    by_id = {c.id: c for c in cats}
+    missing = [cid for cid in category_ids if cid not in by_id]
+    if missing:
+        raise ValidationError({"categories": f"Invalid category id(s): {missing}."})
+    ordered_cats = [by_id[cid] for cid in category_ids]
+    txn.category = ordered_cats[0]
+    Transaction.objects.filter(pk=txn.pk).update(category_id=ordered_cats[0].id)
+    txn.categories.set(ordered_cats)
+
+
+def clear_expense_categories(txn):
+    txn.categories.clear()
 
 
 # -----------------------------------------------------------------------------
@@ -129,7 +192,6 @@ class TransactionItemSerializer(serializers.ModelSerializer):
             "cost",
             "quantity",
             "unit",
-            "category",
             "date_created",
             "date_last_modified",
             "created_at",
@@ -144,14 +206,6 @@ class TransactionItemSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
-    def validate_category(self, category):
-        request = self.context["request"]
-        if category.owner_id != request.user.id:
-            raise ValidationError("Invalid category.")
-        if category.kind != "expense":
-            raise ValidationError("Line items require an expense category.")
-        return category
-
 
 class DraftTransactionItemSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
@@ -162,7 +216,8 @@ class DraftTransactionItemSerializer(serializers.Serializer):
         max_digits=10, decimal_places=2, min_value=Decimal("0")
     )
     unit = serializers.ChoiceField(choices=UNIT_CHOICES, default="pcs")
-    category_id = serializers.IntegerField()
+    # Accepted for OCR rollup only; not stored on TransactionItem.
+    category_id = serializers.IntegerField(required=False, allow_null=True)
 
 
 # -----------------------------------------------------------------------------
@@ -174,6 +229,9 @@ class TransactionSerializer(serializers.ModelSerializer):
         max_digits=14, decimal_places=2, read_only=True, required=False, allow_null=True
     )
     item_count = serializers.IntegerField(read_only=True, required=False)
+    categories = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Category.objects.all(), required=False
+    )
 
     class Meta:
         model = Transaction
@@ -186,6 +244,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "merchant",
             "note",
             "category",
+            "categories",
             "receipt_image",
             "status",
             "date_created",
@@ -207,32 +266,147 @@ class TransactionSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request and getattr(request, "user", None):
+            self.fields["categories"].child_relation.queryset = Category.objects.filter(
+                owner=request.user
+            )
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if instance.type == "expense":
+            # Prefer M2M order with primary first; fall back to primary FK alone.
+            tag_ids = list(instance.categories.values_list("id", flat=True))
+            primary = instance.category_id
+            if primary:
+                ordered = [primary] + [i for i in tag_ids if i != primary]
+            else:
+                ordered = tag_ids
+            data["categories"] = ordered
+            if primary and primary not in ordered:
+                data["categories"] = [primary] + ordered
+        else:
+            data["categories"] = []
+        return data
+
     def validate(self, attrs):
         request = self.context["request"]
         txn_type = attrs.get("type", getattr(self.instance, "type", None))
-        category = attrs.get("category", getattr(self.instance, "category", None))
+        category = attrs.get("category", serializers.empty)
+        if category is serializers.empty:
+            category = getattr(self.instance, "category", None)
+        categories_provided = "categories" in attrs
+        categories = attrs.get("categories") if categories_provided else None
 
-        if txn_type in ("income", "expense"):
+        if txn_type == "expense":
+            primary_id = category.id if category is not None else None
+            if categories_provided:
+                raw_ids = [
+                    c.id if isinstance(c, Category) else c for c in (categories or [])
+                ]
+                resolved = resolve_expense_category_ids(primary_id, raw_ids)
+                if not resolved:
+                    raise ValidationError(
+                        {"categories": "At least one expense category is required."}
+                    )
+                cats = list(
+                    Category.objects.filter(
+                        owner=request.user, kind="expense", pk__in=resolved
+                    )
+                )
+                by_id = {c.id: c for c in cats}
+                if len(by_id) != len(resolved):
+                    raise ValidationError(
+                        {
+                            "categories": (
+                                "All categories must be valid expense categories."
+                            )
+                        }
+                    )
+                attrs["_expense_category_ids"] = resolved
+                attrs["category"] = by_id[resolved[0]]
+            elif "category" in attrs:
+                if category is None:
+                    raise ValidationError(
+                        {"category": "Category is required for expense transactions."}
+                    )
+                if category.owner_id != request.user.id or category.kind != "expense":
+                    raise ValidationError(
+                        {"category": "Category kind must be expense."}
+                    )
+                attrs["_expense_primary_id"] = category.id
+            elif not self.instance:
+                raise ValidationError(
+                    {"category": "Category is required for expense transactions."}
+                )
+            attrs.pop("categories", None)
+
+        elif txn_type == "income":
             if category is None:
                 raise ValidationError(
-                    {"category": "Category is required for income and expense."}
+                    {"category": "Category is required for income transactions."}
                 )
             if category.owner_id != request.user.id:
                 raise ValidationError({"category": "Invalid category."})
-            expected_kind = "income" if txn_type == "income" else "expense"
-            if category.kind != expected_kind:
-                raise ValidationError(
-                    {"category": f"Category kind must be {expected_kind}."}
-                )
+            if category.kind != "income":
+                raise ValidationError({"category": "Category kind must be income."})
+            attrs.pop("categories", None)
+            attrs["_clear_categories"] = True
+
         elif txn_type in ("transfer_in", "transfer_out"):
-            # Always clear category on transfers (partial updates often omit it).
             attrs["category"] = None
+            attrs.pop("categories", None)
+            attrs["_clear_categories"] = True
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         if amount is not None and amount < 0:
             raise ValidationError({"amount": "Amount must be zero or positive."})
 
         return attrs
+
+    def create(self, validated_data):
+        expense_ids = validated_data.pop("_expense_category_ids", None)
+        primary_only = validated_data.pop("_expense_primary_id", None)
+        validated_data.pop("_clear_categories", None)
+        validated_data.pop("categories", None)
+        if expense_ids is None and primary_only is not None:
+            expense_ids = [primary_only]
+        elif expense_ids is None and validated_data.get("category") is not None:
+            expense_ids = [validated_data["category"].id]
+        txn = super().create(validated_data)
+        if expense_ids is not None:
+            apply_expense_categories(
+                txn, expense_ids, owner=self.context["request"].user
+            )
+        return txn
+
+    def update(self, instance, validated_data):
+        expense_ids = validated_data.pop("_expense_category_ids", None)
+        primary_only = validated_data.pop("_expense_primary_id", None)
+        clear_cats = validated_data.pop("_clear_categories", False)
+        validated_data.pop("categories", None)
+        txn = super().update(instance, validated_data)
+        if clear_cats:
+            clear_expense_categories(txn)
+        elif expense_ids is not None:
+            apply_expense_categories(
+                txn, expense_ids, owner=self.context["request"].user
+            )
+        elif primary_only is not None and txn.type == "expense":
+            existing = list(txn.categories.values_list("id", flat=True))
+            if not existing and txn.category_id:
+                existing = [txn.category_id]
+            merged = resolve_expense_category_ids(
+                primary_only, existing or [primary_only]
+            )
+            apply_expense_categories(txn, merged, owner=self.context["request"].user)
+        elif txn.type == "expense" and txn.category_id and not txn.categories.exists():
+            apply_expense_categories(
+                txn, [txn.category_id], owner=self.context["request"].user
+            )
+        return txn
 
 
 class CommitBankEntrySerializer(serializers.Serializer):
@@ -271,6 +445,12 @@ class CommitReceiptSerializer(serializers.Serializer):
     merchant = serializers.CharField(max_length=255, allow_blank=True, required=False)
     note = serializers.CharField(allow_blank=True, required=False, default="")
     category_id = serializers.IntegerField(required=False, allow_null=True)
+    category_ids = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        allow_empty=False,
+        max_length=MAX_EXPENSE_CATEGORIES,
+    )
     date_effective = serializers.DateField(required=False)
     items = DraftTransactionItemSerializer(many=True, required=False, allow_empty=True)
     entries = CommitBankEntrySerializer(many=True, required=False, allow_empty=True)
@@ -279,10 +459,28 @@ class CommitReceiptSerializer(serializers.Serializer):
         kind = attrs.get("document_kind") or "retail_receipt"
         attrs["document_kind"] = kind
         if kind == "retail_receipt":
-            if not attrs.get("category_id"):
+            primary = attrs.get("category_id")
+            extras = attrs.get("category_ids")
+            # Roll up optional per-line category_ids from items when header list omitted.
+            if not extras and attrs.get("items"):
+                rolled = []
+                if primary:
+                    rolled.append(primary)
+                for row in attrs["items"]:
+                    cid = row.get("category_id")
+                    if cid and cid not in rolled:
+                        rolled.append(cid)
+                extras = rolled[:MAX_EXPENSE_CATEGORIES] or None
+            try:
+                resolved = resolve_expense_category_ids(primary, extras)
+            except ValidationError:
+                raise
+            if not resolved:
                 raise ValidationError(
                     {"category_id": "Category is required for retail receipts."}
                 )
+            attrs["category_ids"] = resolved
+            attrs["category_id"] = resolved[0]
             if not attrs.get("items"):
                 raise ValidationError(
                     {"items": "At least one line item is required for retail receipts."}
