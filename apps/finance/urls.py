@@ -10,7 +10,12 @@ from .purchases import (
     PurchaseMarkRegularView,
     PurchaseNotificationsView,
 )
-from .receipt_views import CommitReceiptView, ReceiptScanView
+from .receipt_views import (
+    BulkCommitReceiptView,
+    BulkScanReceiptView,
+    CommitReceiptView,
+    ReceiptScanView,
+)
 from .views import CategoryViewSet, TransactionItemViewSet, TransactionViewSet
 
 
@@ -68,9 +73,19 @@ urlpatterns = [
         name="finance-scan-receipt",
     ),
     path(
+        "finance/transactions/bulk-scan-receipts/",
+        BulkScanReceiptView.as_view(),
+        name="finance-bulk-scan-receipts",
+    ),
+    path(
         "finance/transactions/commit-receipt/",
         CommitReceiptView.as_view(),
         name="finance-commit-receipt",
+    ),
+    path(
+        "finance/transactions/bulk-commit-receipts/",
+        BulkCommitReceiptView.as_view(),
+        name="finance-bulk-commit-receipts",
     ),
     path(
         "finance/transactions/<int:transaction_pk>/items/",

@@ -493,6 +493,22 @@ class CommitReceiptSerializer(serializers.Serializer):
         return attrs
 
 
+MAX_BULK_RECEIPT_COMMITS = 10
+
+
+class BulkCommitReceiptSerializer(serializers.Serializer):
+    """Validate a batch of reviewed receipt drafts (1–10)."""
+
+    receipts = CommitReceiptSerializer(many=True, allow_empty=False)
+
+    def validate_receipts(self, value):
+        if len(value) > MAX_BULK_RECEIPT_COMMITS:
+            raise ValidationError(
+                f"At most {MAX_BULK_RECEIPT_COMMITS} receipts per batch."
+            )
+        return value
+
+
 # -----------------------------------------------------------------------------
 # Balance / starting balance
 # -----------------------------------------------------------------------------
