@@ -50,7 +50,15 @@ DEBUG = env_bool("DJANGO_DEBUG", True)
 # Allowed hosts and CSRF trusted origins
 # -----------------------------------------------------------------------------
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
-CSRF_TRUSTED_ORIGINS = env_list("CSRF_TRUSTED_ORIGINS", "http://localhost:5173")
+CSRF_TRUSTED_ORIGINS = env_list(
+    "CSRF_TRUSTED_ORIGINS",
+    "http://localhost:5173,https://tauri.localhost,http://tauri.localhost",
+)
+
+# iOS LAN prototype: DEBUG runserver is reachable as http://<LAN_IP>:8000.
+# DHCP IPs change; allow any Host in DEBUG unless explicitly disabled.
+if DEBUG and env_bool("DJANGO_ALLOW_LAN_HOSTS", True) and "*" not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS = list(ALLOWED_HOSTS) + ["*"]
 
 # -----------------------------------------------------------------------------
 # Installed apps
@@ -191,9 +199,34 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # CORS
 # -----------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = env_list(
-    "CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,"
+    "https://tauri.localhost,http://tauri.localhost,tauri://localhost",
+)
+CORS_ALLOWED_ORIGIN_REGEXES = env_list(
+    "CORS_ALLOWED_ORIGIN_REGEXES",
+    r"^https?://tauri\.localhost$,^tauri://localhost$",
 )
 CORS_ALLOW_CREDENTIALS = True
+
+# WKWebView origin varies by Tauri 2.x; keep prototype origins even if .env
+# only lists Vite. DEBUG-only so production env lists stay explicit.
+_TAURI_WEBVIEW_ORIGINS = (
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+    "tauri://localhost",
+)
+if DEBUG:
+    extra = [
+        origin
+        for origin in _TAURI_WEBVIEW_ORIGINS
+        if origin not in CORS_ALLOWED_ORIGINS
+    ]
+    if extra:
+        CORS_ALLOWED_ORIGINS = list(CORS_ALLOWED_ORIGINS) + extra
+    for origin in ("https://tauri.localhost", "http://tauri.localhost"):
+        if origin not in CSRF_TRUSTED_ORIGINS:
+            CSRF_TRUSTED_ORIGINS = list(CSRF_TRUSTED_ORIGINS) + [origin]
 
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 
