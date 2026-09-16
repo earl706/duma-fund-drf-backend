@@ -37,6 +37,14 @@ def env_list(key, default=""):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _extend_unique(seq, items):
+    out = list(seq)
+    for item in items:
+        if item not in out:
+            out.append(item)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Core security
 # -----------------------------------------------------------------------------
@@ -55,8 +63,8 @@ CSRF_TRUSTED_ORIGINS = env_list(
     "http://localhost:5173,https://tauri.localhost,http://tauri.localhost",
 )
 
-# iOS LAN prototype: DEBUG runserver is reachable as http://<LAN_IP>:8000.
-# DHCP IPs change; allow any Host in DEBUG unless explicitly disabled.
+# iOS LAN prototype: DEBUG runserver (and desktop Gunicorn) accept any Host so
+# DHCP IPs and typed hostnames work. Disable with DJANGO_ALLOW_LAN_HOSTS=false.
 if DEBUG and env_bool("DJANGO_ALLOW_LAN_HOSTS", True) and "*" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS = list(ALLOWED_HOSTS) + ["*"]
 
@@ -210,23 +218,34 @@ CORS_ALLOWED_ORIGIN_REGEXES = env_list(
 CORS_ALLOW_CREDENTIALS = True
 
 # WKWebView origin varies by Tauri 2.x; keep prototype origins even if .env
-# only lists Vite. DEBUG-only so production env lists stay explicit.
+# only lists Vite. DEBUG and DESKTOP_MODE append LAN regexes.
 _TAURI_WEBVIEW_ORIGINS = (
     "https://tauri.localhost",
     "http://tauri.localhost",
     "tauri://localhost",
 )
+# ios:dev SPA origin is http://<LAN_IP>:1430; IPA origin is tauri.localhost.
+_LAN_ORIGIN_REGEXES = [
+    r"^https?://tauri\.localhost$",
+    r"^tauri://localhost$",
+    r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    r"^https?://("
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$",
+    r"^https?://[a-zA-Z0-9.-]+\.local(:\d+)?$",
+]
 if DEBUG:
-    extra = [
-        origin
-        for origin in _TAURI_WEBVIEW_ORIGINS
-        if origin not in CORS_ALLOWED_ORIGINS
-    ]
-    if extra:
-        CORS_ALLOWED_ORIGINS = list(CORS_ALLOWED_ORIGINS) + extra
-    for origin in ("https://tauri.localhost", "http://tauri.localhost"):
-        if origin not in CSRF_TRUSTED_ORIGINS:
-            CSRF_TRUSTED_ORIGINS = list(CSRF_TRUSTED_ORIGINS) + [origin]
+    CORS_ALLOWED_ORIGINS = _extend_unique(CORS_ALLOWED_ORIGINS, _TAURI_WEBVIEW_ORIGINS)
+    CORS_ALLOWED_ORIGIN_REGEXES = _extend_unique(
+        CORS_ALLOWED_ORIGIN_REGEXES,
+        _LAN_ORIGIN_REGEXES,
+    )
+    CSRF_TRUSTED_ORIGINS = _extend_unique(
+        CSRF_TRUSTED_ORIGINS,
+        ("https://tauri.localhost", "http://tauri.localhost"),
+    )
 
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 
@@ -424,8 +443,17 @@ DESKTOP_MODE = env_bool("APP_DESKTOP", False)
 
 if DESKTOP_MODE:
     DEBUG = False
-    ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
-    CSRF_TRUSTED_ORIGINS = ["http://127.0.0.1:8000", "http://localhost:8000"]
+    # iPhone on LAN uses Host: <Mac IPv4>. Loopback still used by the Mac WebView.
+    ALLOWED_HOSTS = ["*"]
+    CSRF_TRUSTED_ORIGINS = _extend_unique(
+        ["http://127.0.0.1:8000", "http://localhost:8000"],
+        ("https://tauri.localhost", "http://tauri.localhost"),
+    )
+    CORS_ALLOWED_ORIGINS = _extend_unique(CORS_ALLOWED_ORIGINS, _TAURI_WEBVIEW_ORIGINS)
+    CORS_ALLOWED_ORIGIN_REGEXES = _extend_unique(
+        CORS_ALLOWED_ORIGIN_REGEXES,
+        _LAN_ORIGIN_REGEXES,
+    )
 
     DATA_DIR = Path(
         env(
