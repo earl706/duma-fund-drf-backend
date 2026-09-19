@@ -3,6 +3,16 @@ from rest_framework.routers import DefaultRouter
 
 from .analytics import FinanceAnalyticsView, FinanceBreakdownView
 from .balance import BalanceView
+from .profile_views import (
+    MyInviteAcceptView,
+    MyInviteDeclineView,
+    MyInviteListView,
+    ProfileDetailView,
+    ProfileInviteRevokeView,
+    ProfileListCreateView,
+    ProfileMemberDetailView,
+    ProfileMemberListCreateView,
+)
 from .purchases import (
     PurchaseExcludeView,
     PurchaseInsightsView,
@@ -27,6 +37,46 @@ router.register(
 
 # Specific transaction paths before router detail routes.
 urlpatterns = [
+    path(
+        "finance/profiles/",
+        ProfileListCreateView.as_view(),
+        name="finance-profile-list",
+    ),
+    path(
+        "finance/profiles/<int:pk>/",
+        ProfileDetailView.as_view(),
+        name="finance-profile-detail",
+    ),
+    path(
+        "finance/profiles/<int:pk>/members/",
+        ProfileMemberListCreateView.as_view(),
+        name="finance-profile-member-list",
+    ),
+    path(
+        "finance/profiles/<int:pk>/members/<int:user_id>/",
+        ProfileMemberDetailView.as_view(),
+        name="finance-profile-member-detail",
+    ),
+    path(
+        "finance/profiles/<int:pk>/invites/<int:invite_id>/",
+        ProfileInviteRevokeView.as_view(),
+        name="finance-profile-invite-revoke",
+    ),
+    path(
+        "finance/invites/",
+        MyInviteListView.as_view(),
+        name="finance-invite-list",
+    ),
+    path(
+        "finance/invites/<int:pk>/accept/",
+        MyInviteAcceptView.as_view(),
+        name="finance-invite-accept",
+    ),
+    path(
+        "finance/invites/<int:pk>/decline/",
+        MyInviteDeclineView.as_view(),
+        name="finance-invite-decline",
+    ),
     path(
         "finance/balance/",
         BalanceView.as_view(),

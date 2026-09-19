@@ -8,11 +8,23 @@ from rest_framework.exceptions import ValidationError
 from .models import (
     MAX_EXPENSE_CATEGORIES,
     UNIT_CHOICES,
+    BudgetProfile,
     Category,
     Transaction,
     TransactionItem,
-    UserFinance,
 )
+
+
+def _request_profile(context):
+    request = context.get("request")
+    if request is None:
+        return None
+    profile = getattr(request, "_budget_profile", None)
+    if profile is not None:
+        return profile
+    from .scope import resolve_profile
+
+    return resolve_profile(request)
 
 
 LINE_TOTAL = ExpressionWrapper(
@@ -93,14 +105,14 @@ def resolve_expense_category_ids(primary_id, category_ids):
     return ordered
 
 
-def apply_expense_categories(txn, category_ids, *, owner):
+def apply_expense_categories(txn, category_ids, *, profile):
     """Validate expense Category rows and set primary FK + M2M tags."""
     if not category_ids:
         raise ValidationError(
             {"categories": "At least one expense category is required."}
         )
     cats = list(
-        Category.objects.filter(owner=owner, kind="expense", pk__in=category_ids)
+        Category.objects.filter(profile=profile, kind="expense", pk__in=category_ids)
     )
     by_id = {c.id: c for c in cats}
     missing = [cid for cid in category_ids if cid not in by_id]
@@ -135,13 +147,13 @@ class CategorySerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "uuid", "is_system", "created_at", "updated_at"]
 
     def validate(self, attrs):
-        owner = self.context["request"].user
+        profile = _request_profile(self.context)
         parent = attrs.get("parent", getattr(self.instance, "parent", None))
         kind = attrs.get("kind", getattr(self.instance, "kind", None))
         name = attrs.get("name", getattr(self.instance, "name", None))
 
         if parent is not None:
-            if parent.owner_id != owner.id:
+            if profile is None or parent.profile_id != profile.id:
                 raise ValidationError({"parent": "Invalid parent category."})
             if parent.parent_id is not None:
                 raise ValidationError(
@@ -152,9 +164,9 @@ class CategorySerializer(serializers.ModelSerializer):
             if not kind:
                 attrs["kind"] = parent.kind
 
-        if name and kind:
+        if name and kind and profile is not None:
             qs = Category.objects.filter(
-                owner=owner,
+                profile=profile,
                 parent=parent,
                 kind=kind,
                 name__iexact=name.strip(),
@@ -270,9 +282,11 @@ class TransactionSerializer(serializers.ModelSerializer):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
         if request and getattr(request, "user", None):
-            self.fields["categories"].child_relation.queryset = Category.objects.filter(
-                owner=request.user
-            )
+            profile = getattr(request, "_budget_profile", None)
+            qs = Category.objects.all()
+            if profile is not None:
+                qs = qs.filter(profile=profile)
+            self.fields["categories"].child_relation.queryset = qs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -293,6 +307,7 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         request = self.context["request"]
+        profile = _request_profile(self.context)
         txn_type = attrs.get("type", getattr(self.instance, "type", None))
         category = attrs.get("category", serializers.empty)
         if category is serializers.empty:
@@ -313,7 +328,7 @@ class TransactionSerializer(serializers.ModelSerializer):
                     )
                 cats = list(
                     Category.objects.filter(
-                        owner=request.user, kind="expense", pk__in=resolved
+                        profile=profile, kind="expense", pk__in=resolved
                     )
                 )
                 by_id = {c.id: c for c in cats}
@@ -332,7 +347,11 @@ class TransactionSerializer(serializers.ModelSerializer):
                     raise ValidationError(
                         {"category": "Category is required for expense transactions."}
                     )
-                if category.owner_id != request.user.id or category.kind != "expense":
+                if (
+                    profile is None
+                    or category.profile_id != profile.id
+                    or category.kind != "expense"
+                ):
                     raise ValidationError(
                         {"category": "Category kind must be expense."}
                     )
@@ -348,7 +367,7 @@ class TransactionSerializer(serializers.ModelSerializer):
                 raise ValidationError(
                     {"category": "Category is required for income transactions."}
                 )
-            if category.owner_id != request.user.id:
+            if profile is None or category.profile_id != profile.id:
                 raise ValidationError({"category": "Invalid category."})
             if category.kind != "income":
                 raise ValidationError({"category": "Category kind must be income."})
@@ -378,7 +397,7 @@ class TransactionSerializer(serializers.ModelSerializer):
         txn = super().create(validated_data)
         if expense_ids is not None:
             apply_expense_categories(
-                txn, expense_ids, owner=self.context["request"].user
+                txn, expense_ids, profile=_request_profile(self.context)
             )
         return txn
 
@@ -388,12 +407,11 @@ class TransactionSerializer(serializers.ModelSerializer):
         clear_cats = validated_data.pop("_clear_categories", False)
         validated_data.pop("categories", None)
         txn = super().update(instance, validated_data)
+        profile = _request_profile(self.context)
         if clear_cats:
             clear_expense_categories(txn)
         elif expense_ids is not None:
-            apply_expense_categories(
-                txn, expense_ids, owner=self.context["request"].user
-            )
+            apply_expense_categories(txn, expense_ids, profile=profile)
         elif primary_only is not None and txn.type == "expense":
             existing = list(txn.categories.values_list("id", flat=True))
             if not existing and txn.category_id:
@@ -401,11 +419,9 @@ class TransactionSerializer(serializers.ModelSerializer):
             merged = resolve_expense_category_ids(
                 primary_only, existing or [primary_only]
             )
-            apply_expense_categories(txn, merged, owner=self.context["request"].user)
+            apply_expense_categories(txn, merged, profile=profile)
         elif txn.type == "expense" and txn.category_id and not txn.categories.exists():
-            apply_expense_categories(
-                txn, [txn.category_id], owner=self.context["request"].user
-            )
+            apply_expense_categories(txn, [txn.category_id], profile=profile)
         return txn
 
 
@@ -514,7 +530,7 @@ class BulkCommitReceiptSerializer(serializers.Serializer):
 # -----------------------------------------------------------------------------
 class StartingBalanceSerializer(serializers.ModelSerializer):
     class Meta:
-        model = UserFinance
+        model = BudgetProfile
         fields = ["starting_balance"]
 
 

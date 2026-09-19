@@ -5,10 +5,19 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
-from apps.common.viewsets import OwnedModelViewSet
-
-from .models import Category, Transaction, TransactionItem
-from .seeds import ensure_finance_ready
+from .models import (
+    PROFILE_ROLE_OWNER,
+    Category,
+    Transaction,
+    TransactionItem,
+)
+from .scope import (
+    LEDGER_WRITE_ROLES,
+    OWNER_ONLY_ROLES,
+    ProfileScopedViewSet,
+    require_role,
+    resolve_profile,
+)
 from .serializers import (
     CategoryReassignDeleteSerializer,
     CategorySerializer,
@@ -20,17 +29,16 @@ from .serializers import (
 )
 
 
-def _unlink_or_reassign_category(category, target, owner):
+def _unlink_or_reassign_category(category, target, profile):
     """
     Remove category from expense M2M tags when other labels remain.
     Reassign to target when it is the sole / primary-only category.
     Income keeps a single FK → always reassign.
     """
-    # Income / transfer headers using the FK as primary
     Transaction.objects.filter(category=category, type="income").update(category=target)
 
     expense_qs = (
-        Transaction.objects.filter(owner=owner, type="expense")
+        Transaction.objects.filter(profile=profile, type="expense")
         .filter(Q(category=category) | Q(categories=category))
         .distinct()
     )
@@ -43,38 +51,43 @@ def _unlink_or_reassign_category(category, target, owner):
             continue
         remaining = [i for i in tag_ids if i != category.id]
         if remaining:
-            apply_expense_categories(txn, remaining, owner=owner)
+            apply_expense_categories(txn, remaining, profile=profile)
         else:
-            apply_expense_categories(txn, [target.id], owner=owner)
+            apply_expense_categories(txn, [target.id], profile=profile)
 
 
 # -----------------------------------------------------------------------------
-# Categories
+# Categories (owner-only writes)
 # -----------------------------------------------------------------------------
-class CategoryViewSet(OwnedModelViewSet):
+class CategoryViewSet(ProfileScopedViewSet):
     serializer_class = CategorySerializer
     queryset = Category.objects.all()
     filterset_fields = ["kind", "parent", "is_system"]
     search_fields = ["name"]
     ordering_fields = ["name", "kind", "created_at"]
+    write_roles = OWNER_ONLY_ROLES
 
     def get_queryset(self):
-        ensure_finance_ready(self.request.user)
         return super().get_queryset().select_related("parent")
 
     def perform_create(self, serializer):
-        ensure_finance_ready(self.request.user)
-        serializer.save(owner=self.request.user, is_system=False)
+        serializer.save(
+            owner=self.request.user,
+            profile=self.get_profile(),
+            is_system=False,
+        )
 
     @action(detail=True, methods=["post"], url_path="reassign-and-delete")
     def reassign_and_delete(self, request, pk=None):
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         category = self.get_object()
         ser = CategoryReassignDeleteSerializer(data=request.data)
         ser.is_valid(raise_exception=True)
         target_id = ser.validated_data["target_category_id"]
+        profile = self.get_profile()
         try:
             target = Category.objects.get(
-                pk=target_id, owner=request.user, kind=category.kind
+                pk=target_id, profile=profile, kind=category.kind
             )
         except Category.DoesNotExist as exc:
             raise ValidationError(
@@ -86,18 +99,19 @@ class CategoryViewSet(OwnedModelViewSet):
             )
 
         with db_transaction.atomic():
-            _unlink_or_reassign_category(category, target, request.user)
+            _unlink_or_reassign_category(category, target, profile)
             Category.objects.filter(parent=category).update(parent=target)
             category.delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     def destroy(self, request, *args, **kwargs):
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         category = self.get_object()
-        # Sole-category expenses or income headers still need reassign.
+        profile = self.get_profile()
         sole_expense = False
         for txn in (
-            Transaction.objects.filter(owner=request.user, type="expense")
+            Transaction.objects.filter(profile=profile, type="expense")
             .filter(Q(category=category) | Q(categories=category))
             .distinct()
             .prefetch_related("categories")
@@ -125,9 +139,8 @@ class CategoryViewSet(OwnedModelViewSet):
             )
 
         with db_transaction.atomic():
-            # Multi-tagged expenses: drop this link only; promote another primary.
             for txn in (
-                Transaction.objects.filter(owner=request.user, type="expense")
+                Transaction.objects.filter(profile=profile, type="expense")
                 .filter(Q(category=category) | Q(categories=category))
                 .distinct()
             ):
@@ -138,7 +151,7 @@ class CategoryViewSet(OwnedModelViewSet):
                     ]
                 remaining = [i for i in tag_ids if i != category.id]
                 if remaining:
-                    apply_expense_categories(txn, remaining, owner=request.user)
+                    apply_expense_categories(txn, remaining, profile=profile)
             category.delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -147,7 +160,7 @@ class CategoryViewSet(OwnedModelViewSet):
 # -----------------------------------------------------------------------------
 # Transactions
 # -----------------------------------------------------------------------------
-class TransactionViewSet(OwnedModelViewSet):
+class TransactionViewSet(ProfileScopedViewSet):
     serializer_class = TransactionSerializer
     queryset = Transaction.objects.all()
     filterset_fields = ["type", "status", "date_effective", "date_created"]
@@ -163,9 +176,9 @@ class TransactionViewSet(OwnedModelViewSet):
         "created_at",
         "updated_at",
     ]
+    write_roles = LEDGER_WRITE_ROLES
 
     def get_queryset(self):
-        ensure_finance_ready(self.request.user)
         qs = (
             annotate_transaction_amount(super().get_queryset())
             .annotate(item_count=Count("items", distinct=True))
@@ -180,12 +193,12 @@ class TransactionViewSet(OwnedModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        ensure_finance_ready(self.request.user)
         txn_type = serializer.validated_data.get("type")
+        extras = {"owner": self.request.user, "profile": self.get_profile()}
         if txn_type in ("transfer_in", "transfer_out"):
-            serializer.save(owner=self.request.user, category=None)
+            serializer.save(category=None, **extras)
         else:
-            serializer.save(owner=self.request.user)
+            serializer.save(**extras)
 
     def perform_update(self, serializer):
         instance = serializer.save()
@@ -195,7 +208,7 @@ class TransactionViewSet(OwnedModelViewSet):
 # -----------------------------------------------------------------------------
 # Nested transaction items
 # -----------------------------------------------------------------------------
-class TransactionItemViewSet(OwnedModelViewSet):
+class TransactionItemViewSet(ProfileScopedViewSet):
     serializer_class = TransactionItemSerializer
     queryset = TransactionItem.objects.all()
     filterset_fields = ["status", "date_created"]
@@ -210,21 +223,22 @@ class TransactionItemViewSet(OwnedModelViewSet):
         "date_last_modified",
         "created_at",
     ]
+    write_roles = LEDGER_WRITE_ROLES
 
-    def _owned_transaction(self):
+    def get_queryset(self):
+        txn = self._scoped_transaction()
+        return TransactionItem.objects.filter(transaction=txn)
+
+    def _scoped_transaction(self):
         try:
             return Transaction.objects.get(
-                pk=self.kwargs["transaction_pk"], owner=self.request.user
+                pk=self.kwargs["transaction_pk"], profile=resolve_profile(self.request)
             )
         except Transaction.DoesNotExist as exc:
             raise NotFound() from exc
 
-    def get_queryset(self):
-        txn = self._owned_transaction()
-        return super().get_queryset().filter(transaction=txn)
-
     def perform_create(self, serializer):
-        txn = self._owned_transaction()
+        txn = self._scoped_transaction()
         if txn.type != "expense":
             raise ValidationError(
                 {"detail": "Line items are only allowed on expense transactions."}

@@ -8,14 +8,11 @@ from django.db import transaction as db_transaction
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
-
-from apps.accounts.permissions import IsEmailVerified
 
 from .models import Category, Transaction, TransactionItem, today
 from .receipt_scan import scan_receipt_image
+from .scope import LEDGER_WRITE_ROLES, ProfileScopedAPIView
 from .serializers import (
     BulkCommitReceiptSerializer,
     CommitReceiptSerializer,
@@ -24,7 +21,6 @@ from .serializers import (
     apply_expense_categories,
     sync_expense_amount,
 )
-from .seeds import ensure_finance_ready
 from .views import annotate_transaction_amount
 
 
@@ -120,14 +116,14 @@ def collect_bulk_images(request, count):
     return images
 
 
-class ReceiptScanView(APIView):
+class ReceiptScanView(ProfileScopedAPIView):
     """POST multipart image → vision draft (retail or bank). Does not persist."""
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
     parser_classes = [MultiPartParser, FormParser]
+    write_roles = LEDGER_WRITE_ROLES
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        self.assert_write()
         upload = request.FILES.get("image")
         if not upload:
             raise ValidationError({"image": "Receipt image is required."})
@@ -138,7 +134,11 @@ class ReceiptScanView(APIView):
 
         try:
             draft = scan_receipt_image(
-                file_bytes, mime_type, request.user, llm_override=llm_override
+                file_bytes,
+                mime_type,
+                request.user,
+                llm_override=llm_override,
+                profile=self.get_profile(),
             )
         except RuntimeError as exc:
             return Response(
@@ -150,18 +150,18 @@ class ReceiptScanView(APIView):
         return Response(draft)
 
 
-class BulkScanReceiptView(APIView):
+class BulkScanReceiptView(ProfileScopedAPIView):
     """
     POST multipart (max 10): image_0…image_{n-1} + optional llm_* → OCR drafts.
     Partial success: each index returns ok + draft, or ok=false + detail.
     Does not persist.
     """
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
     parser_classes = [MultiPartParser, FormParser]
+    write_roles = LEDGER_WRITE_ROLES
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        self.assert_write()
         count_raw = request.data.get("count")
         try:
             count = int(count_raw) if count_raw not in (None, "") else 0
@@ -191,7 +191,11 @@ class BulkScanReceiptView(APIView):
         for index, (file_bytes, mime_type, _name) in enumerate(images):
             try:
                 draft = scan_receipt_image(
-                    file_bytes, mime_type, request.user, llm_override=llm_override
+                    file_bytes,
+                    mime_type,
+                    request.user,
+                    llm_override=llm_override,
+                    profile=self.get_profile(),
                 )
                 kind = draft.get("document_kind") or (
                     "bank_slip" if draft.get("entries") else "retail_receipt"
@@ -257,12 +261,12 @@ class CommitReceiptMixin:
         )
         return TransactionSerializer(qs.get(), context={"request": request}).data
 
-    def _commit_retail(self, owner, payload, image_bytes, image_name, request):
+    def _commit_retail(self, owner, profile, payload, image_bytes, image_name, request):
         category_ids = payload["category_ids"]
         cats = {
             c.id: c
             for c in Category.objects.filter(
-                owner=owner, kind="expense", pk__in=category_ids
+                profile=profile, kind="expense", pk__in=category_ids
             )
         }
         missing = [cid for cid in category_ids if cid not in cats]
@@ -280,6 +284,7 @@ class CommitReceiptMixin:
         with db_transaction.atomic():
             txn = Transaction.objects.create(
                 owner=owner,
+                profile=profile,
                 type="expense",
                 amount=Decimal("0.00"),
                 title=title,
@@ -289,7 +294,7 @@ class CommitReceiptMixin:
                 date_created=today(),
                 date_effective=effective,
             )
-            apply_expense_categories(txn, category_ids, owner=owner)
+            apply_expense_categories(txn, category_ids, profile=profile)
             self._attach_image(txn, image_bytes, image_name)
 
             for row in payload["items"]:
@@ -307,7 +312,7 @@ class CommitReceiptMixin:
 
         return self._serialize_txn(txn.pk, request)
 
-    def _commit_bank(self, owner, payload, image_bytes, image_name, request):
+    def _commit_bank(self, owner, profile, payload, image_bytes, image_name, request):
         income_cats = {}
         for entry in payload["entries"]:
             if entry["txn_type"] != "income":
@@ -316,7 +321,7 @@ class CommitReceiptMixin:
             if cid not in income_cats:
                 try:
                     income_cats[cid] = Category.objects.get(
-                        pk=cid, owner=owner, kind="income"
+                        pk=cid, profile=profile, kind="income"
                     )
                 except Category.DoesNotExist as exc:
                     raise ValidationError(
@@ -340,6 +345,7 @@ class CommitReceiptMixin:
                 )
                 txn = Transaction.objects.create(
                     owner=owner,
+                    profile=profile,
                     type=txn_type,
                     amount=entry["amount"],
                     title=title,
@@ -355,21 +361,23 @@ class CommitReceiptMixin:
 
         return [self._serialize_txn(pk, request) for pk in created_ids]
 
-    def _commit_one(self, owner, payload, image_bytes, image_name, request):
+    def _commit_one(self, owner, profile, payload, image_bytes, image_name, request):
         if payload["document_kind"] == "bank_slip":
             created = self._commit_bank(
-                owner, payload, image_bytes, image_name, request
+                owner, profile, payload, image_bytes, image_name, request
             )
             return {
                 "document_kind": "bank_slip",
                 "results": created,
                 "id": created[0]["id"] if created else None,
             }
-        txn_data = self._commit_retail(owner, payload, image_bytes, image_name, request)
+        txn_data = self._commit_retail(
+            owner, profile, payload, image_bytes, image_name, request
+        )
         return {**txn_data, "document_kind": "retail_receipt"}
 
 
-class CommitReceiptView(CommitReceiptMixin, APIView):
+class CommitReceiptView(CommitReceiptMixin, ProfileScopedAPIView):
     """
     POST multipart:
       retail_receipt — image + title, note, category_id / category_ids, date_effective, items
@@ -377,11 +385,11 @@ class CommitReceiptView(CommitReceiptMixin, APIView):
       bank_slip — image + entries (JSON) → one or more income/transfer Transactions
     """
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    write_roles = LEDGER_WRITE_ROLES
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        self.assert_write()
         data = parse_commit_payload(request.data)
         ser = CommitReceiptSerializer(data=data)
         ser.is_valid(raise_exception=True)
@@ -390,12 +398,17 @@ class CommitReceiptView(CommitReceiptMixin, APIView):
         image_bytes = upload.read() if upload else None
         image_name = upload.name if upload else None
         result = self._commit_one(
-            request.user, payload, image_bytes, image_name, request
+            request.user,
+            self.get_profile(),
+            payload,
+            image_bytes,
+            image_name,
+            request,
         )
         return Response(result, status=status.HTTP_201_CREATED)
 
 
-class BulkCommitReceiptView(CommitReceiptMixin, APIView):
+class BulkCommitReceiptView(CommitReceiptMixin, ProfileScopedAPIView):
     """
     POST multipart (max 10):
       receipts — JSON array of CommitReceiptSerializer fields (mixed retail + bank OK)
@@ -403,11 +416,11 @@ class BulkCommitReceiptView(CommitReceiptMixin, APIView):
     Atomically creates all transactions; one failure rolls back the batch.
     """
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
+    write_roles = LEDGER_WRITE_ROLES
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        self.assert_write()
         receipts_raw = _loads_json_field(request.data.get("receipts"), "receipts")
         if not isinstance(receipts_raw, list):
             raise ValidationError({"receipts": "Expected a JSON array."})
@@ -438,12 +451,15 @@ class BulkCommitReceiptView(CommitReceiptMixin, APIView):
                 images.append((None, None))
 
         owner = request.user
+        profile = self.get_profile()
         results = []
         with db_transaction.atomic():
             for index, payload in enumerate(payloads):
                 image_bytes, image_name = images[index]
                 results.append(
-                    self._commit_one(owner, payload, image_bytes, image_name, request)
+                    self._commit_one(
+                        owner, profile, payload, image_bytes, image_name, request
+                    )
                 )
 
         expense_count = sum(

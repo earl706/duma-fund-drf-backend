@@ -123,29 +123,30 @@ class MatchStats:
     score: float = 0.0
 
 
-def load_exclusions(owner) -> set[tuple[str, str]]:
+def load_exclusions(profile) -> set[tuple[str, str]]:
     return {
         (row.key_a, row.key_b)
-        for row in PurchaseExclusion.objects.filter(owner=owner).only("key_a", "key_b")
+        for row in PurchaseExclusion.objects.filter(profile=profile).only(
+            "key_a", "key_b"
+        )
     }
 
 
-def load_regular_marks(owner) -> dict[str, str]:
+def load_regular_marks(profile) -> dict[str, str]:
     return {
         row.family_key: row.display_title
-        for row in PurchaseRegularMark.objects.filter(owner=owner).only(
+        for row in PurchaseRegularMark.objects.filter(profile=profile).only(
             "family_key", "display_title"
         )
     }
 
 
-def iter_purchase_events(owner) -> list[PurchaseEvent]:
+def iter_purchase_events(profile) -> list[PurchaseEvent]:
     """Active expense line items + header-only expenses (no archived)."""
     items = (
         TransactionItem.objects.filter(
-            owner=owner,
             status="active",
-            transaction__owner=owner,
+            transaction__profile=profile,
             transaction__type="expense",
             transaction__status="active",
         )
@@ -176,7 +177,7 @@ def iter_purchase_events(owner) -> list[PurchaseEvent]:
 
     header_only = (
         Transaction.objects.filter(
-            owner=owner,
+            profile=profile,
             type="expense",
             status="active",
         )
@@ -386,16 +387,16 @@ def score_query_against_title(
     return 0.0, "none"
 
 
-def lookup_purchases(owner, query: str, limit: int = 5) -> list[dict]:
+def lookup_purchases(profile, query: str, limit: int = 5) -> list[dict]:
     query = (query or "").strip()
     if len(query) < 2:
         return []
 
     query_norm = normalize_title(query)
     query_fam = family_key(query)
-    exclusions = load_exclusions(owner)
-    regular_marks = load_regular_marks(owner)
-    events = iter_purchase_events(owner)
+    exclusions = load_exclusions(profile)
+    regular_marks = load_regular_marks(profile)
+    events = iter_purchase_events(profile)
     by_norm = group_events_by_normalized(events)
     by_family = group_events_by_family(events)
 
@@ -472,9 +473,9 @@ def lookup_purchases(owner, query: str, limit: int = 5) -> list[dict]:
     return results
 
 
-def build_insights(owner) -> dict:
-    regular_marks = load_regular_marks(owner)
-    events = iter_purchase_events(owner)
+def build_insights(profile) -> dict:
+    regular_marks = load_regular_marks(profile)
+    events = iter_purchase_events(profile)
     by_norm = group_events_by_normalized(events)
     today = timezone.localdate()
 
@@ -534,8 +535,8 @@ def build_insights(owner) -> dict:
     }
 
 
-def build_notifications(owner) -> list[dict]:
-    insights = build_insights(owner)
+def build_notifications(profile) -> list[dict]:
+    insights = build_insights(profile)
     notes = []
     for row in insights["due_soon"]:
         interval = row.get("usual_interval_days")

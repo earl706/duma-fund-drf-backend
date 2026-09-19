@@ -4,23 +4,18 @@ from decimal import Decimal
 
 from django.db.models import Sum, Value
 from django.db.models.functions import Coalesce
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsEmailVerified
-
-from .models import Transaction
-from .seeds import ensure_finance_ready, ensure_user_finance
+from .models import PROFILE_ROLE_OWNER, Transaction
+from .scope import ProfileScopedAPIView, require_role
 from .serializers import StartingBalanceSerializer
 
 
-def compute_balance(user):
-    finance = ensure_user_finance(user)
-    starting = finance.starting_balance or Decimal("0.00")
+def compute_balance(profile):
+    starting = profile.starting_balance or Decimal("0.00")
 
     def typed_sum(txn_type):
-        return Transaction.objects.filter(owner=user, type=txn_type).aggregate(
+        return Transaction.objects.filter(profile=profile, type=txn_type).aggregate(
             total=Coalesce(Sum("amount"), Value(Decimal("0.00")))
         )["total"]
 
@@ -44,15 +39,11 @@ def compute_balance(user):
     }
 
 
-class BalanceView(APIView):
-    """GET derived balance; PATCH starting_balance only."""
-
-    permission_classes = [IsAuthenticated, IsEmailVerified]
+class BalanceView(ProfileScopedAPIView):
+    """GET derived balance; PATCH starting_balance (owner only)."""
 
     def get(self, request):
-        ensure_finance_ready(request.user)
-        data = compute_balance(request.user)
-        # Serialize decimals as strings for JSON stability
+        data = compute_balance(self.get_profile())
         return Response(
             {
                 "starting_balance": str(data["starting_balance"]),
@@ -62,9 +53,9 @@ class BalanceView(APIView):
         )
 
     def patch(self, request):
-        ensure_finance_ready(request.user)
-        finance = ensure_user_finance(request.user)
-        ser = StartingBalanceSerializer(finance, data=request.data, partial=True)
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
+        profile = self.get_profile()
+        ser = StartingBalanceSerializer(profile, data=request.data, partial=True)
         ser.is_valid(raise_exception=True)
         ser.save()
         return self.get(request)

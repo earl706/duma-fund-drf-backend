@@ -2,13 +2,13 @@
 
 from rest_framework import status
 from rest_framework.exceptions import ValidationError
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
 
-from apps.accounts.permissions import IsEmailVerified
-
-from .models import PurchaseExclusion, PurchaseRegularMark
+from .models import (
+    PROFILE_ROLE_OWNER,
+    PurchaseExclusion,
+    PurchaseRegularMark,
+)
 from .purchase_match import (
     build_insights,
     build_notifications,
@@ -17,53 +17,42 @@ from .purchase_match import (
     lookup_purchases,
     normalize_title,
 )
-from .seeds import ensure_finance_ready
+from .scope import ProfileScopedAPIView, require_role
 
 
-class PurchaseLookupView(APIView):
+class PurchaseLookupView(ProfileScopedAPIView):
     """GET ?q=&limit= — fuzzy purchase history for as-you-type hints."""
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
-
     def get(self, request):
-        ensure_finance_ready(request.user)
         q = request.query_params.get("q", "")
         try:
             limit = int(request.query_params.get("limit", 5))
         except (TypeError, ValueError):
             limit = 5
         limit = max(1, min(limit, 15))
-        matches = lookup_purchases(request.user, q, limit=limit)
+        matches = lookup_purchases(self.get_profile(), q, limit=limit)
         return Response({"matches": matches})
 
 
-class PurchaseInsightsView(APIView):
+class PurchaseInsightsView(ProfileScopedAPIView):
     """GET — regular / lapsed / due-soon / recently seen aggregates."""
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
-
     def get(self, request):
-        ensure_finance_ready(request.user)
-        return Response(build_insights(request.user))
+        return Response(build_insights(self.get_profile()))
 
 
-class PurchaseNotificationsView(APIView):
+class PurchaseNotificationsView(ProfileScopedAPIView):
     """GET — informational in-app notifications derived from insights."""
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
-
     def get(self, request):
-        ensure_finance_ready(request.user)
-        return Response({"notifications": build_notifications(request.user)})
+        return Response({"notifications": build_notifications(self.get_profile())})
 
 
-class PurchaseMarkRegularView(APIView):
-    """POST {title} to mark regular; DELETE {title} to unmark."""
-
-    permission_classes = [IsAuthenticated, IsEmailVerified]
+class PurchaseMarkRegularView(ProfileScopedAPIView):
+    """POST {title} to mark regular; DELETE {title} to unmark. Owner only."""
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         title = (request.data.get("title") or "").strip()
         if not title:
             raise ValidationError({"title": "Title is required."})
@@ -72,6 +61,7 @@ class PurchaseMarkRegularView(APIView):
             raise ValidationError({"title": "Could not derive a product key."})
         mark, _created = PurchaseRegularMark.objects.update_or_create(
             owner=request.user,
+            profile=self.get_profile(),
             family_key=fam,
             defaults={"display_title": title},
         )
@@ -84,7 +74,7 @@ class PurchaseMarkRegularView(APIView):
         )
 
     def delete(self, request):
-        ensure_finance_ready(request.user)
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         title = (
             request.data.get("title") or request.query_params.get("title") or ""
         ).strip()
@@ -92,18 +82,16 @@ class PurchaseMarkRegularView(APIView):
             raise ValidationError({"title": "Title is required."})
         fam = family_key(title)
         deleted, _ = PurchaseRegularMark.objects.filter(
-            owner=request.user, family_key=fam
+            profile=self.get_profile(), family_key=fam
         ).delete()
         return Response({"deleted": deleted > 0}, status=status.HTTP_200_OK)
 
 
-class PurchaseExcludeView(APIView):
-    """POST {query_title, matched_title} — mark as not the same product."""
-
-    permission_classes = [IsAuthenticated, IsEmailVerified]
+class PurchaseExcludeView(ProfileScopedAPIView):
+    """POST {query_title, matched_title} — mark as not the same product. Owner only."""
 
     def post(self, request):
-        ensure_finance_ready(request.user)
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         query_title = (request.data.get("query_title") or "").strip()
         matched_title = (request.data.get("matched_title") or "").strip()
         if not query_title or not matched_title:
@@ -115,7 +103,6 @@ class PurchaseExcludeView(APIView):
         if not a or not b:
             raise ValidationError({"detail": "Titles could not be normalized."})
         if a == b:
-            # Fall back to family keys when normalized titles collide oddly
             a = family_key(query_title)
             b = family_key(matched_title)
         key_a, key_b = exclusion_pair(a, b)
@@ -123,6 +110,7 @@ class PurchaseExcludeView(APIView):
             raise ValidationError({"detail": "Titles resolve to the same key."})
         exclusion, created = PurchaseExclusion.objects.get_or_create(
             owner=request.user,
+            profile=self.get_profile(),
             key_a=key_a,
             key_b=key_b,
         )

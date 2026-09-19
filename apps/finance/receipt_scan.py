@@ -583,18 +583,23 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
     )
 
 
-def scan_receipt_image(file_bytes, mime_type, user, llm_override=None):
+def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=None):
     """Call vision provider; return normalized draft (retail or bank)."""
     _validate_image(file_bytes, mime_type)
-    ensure_finance_ready(user)
+    if profile is None:
+        profile = ensure_finance_ready(user)
     expense_categories = list(
-        Category.objects.filter(owner=user, kind="expense").select_related("parent")
+        Category.objects.filter(profile=profile, kind="expense").select_related(
+            "parent"
+        )
     )
     income_categories = list(
-        Category.objects.filter(owner=user, kind="income").select_related("parent")
+        Category.objects.filter(profile=profile, kind="income").select_related(
+            "parent"
+        )
     )
-    expense_fallback = get_default_expense_category(user)
-    income_fallback = get_default_income_category(user)
+    expense_fallback = get_default_expense_category(profile)
+    income_fallback = get_default_income_category(profile)
     expense_fallback_id = expense_fallback.id if expense_fallback else None
     income_fallback_id = income_fallback.id if income_fallback else None
     if expense_fallback_id is None:

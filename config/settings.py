@@ -155,7 +155,7 @@ else:
         }
     }
 
-if "pytest" in sys.modules:
+if "pytest" in sys.modules or "test" in sys.argv:
     DATABASES["default"] = {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": ":memory:",
@@ -216,6 +216,24 @@ CORS_ALLOWED_ORIGIN_REGEXES = env_list(
     r"^https?://tauri\.localhost$,^tauri://localhost$",
 )
 CORS_ALLOW_CREDENTIALS = True
+# Phone WebView is cross-origin (tauri.localhost / LAN :1430 → :8000).
+# Without this, OPTIONS succeeds but GET /finance/* with the profile header
+# is blocked — web Vite proxy is same-origin so it never hit this.
+try:
+    from corsheaders.defaults import default_headers as _cors_default_headers
+except ImportError:
+    _cors_default_headers = (
+        "accept",
+        "authorization",
+        "content-type",
+        "user-agent",
+        "x-csrftoken",
+        "x-requested-with",
+    )
+CORS_ALLOW_HEADERS = list(_cors_default_headers) + ["x-budget-profile-id"]
+if DEBUG:
+    # Avoid WKWebView caching a preflight that omitted the profile header.
+    CORS_PREFLIGHT_MAX_AGE = 0
 
 # WKWebView origin varies by Tauri 2.x; keep prototype origins even if .env
 # only lists Vite. DEBUG and DESKTOP_MODE append LAN regexes.

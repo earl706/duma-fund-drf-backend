@@ -6,15 +6,11 @@ from decimal import Decimal
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Sum, Value
 from django.db.models.functions import Coalesce, TruncDay, TruncMonth, TruncWeek
 from django.utils import timezone
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
-
-from apps.accounts.permissions import IsEmailVerified
 
 from .balance import compute_balance
 from .models import Category, Transaction, TransactionItem
-from .seeds import ensure_finance_ready
+from .scope import ProfileScopedAPIView
 
 
 GRAIN_TRUNC = {
@@ -88,7 +84,7 @@ def _dec_str(value):
     return str(value.quantize(Decimal("0.01")))
 
 
-class FinanceAnalyticsView(APIView):
+class FinanceAnalyticsView(ProfileScopedAPIView):
     """
     GET /api/finance/analytics/?grain=day|week|month&include_archived=0|1&start=&end=
 
@@ -96,10 +92,7 @@ class FinanceAnalyticsView(APIView):
     item_spend and txn_spend both bucket by Transaction.date_effective.
     """
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
-
     def get(self, request):
-        ensure_finance_ready(request.user)
         grain = request.query_params.get("grain", "day")
         if grain not in GRAIN_TRUNC:
             grain = "day"
@@ -119,15 +112,15 @@ class FinanceAnalyticsView(APIView):
             start, end = end, start
 
         trunc = GRAIN_TRUNC[grain]
-        owner = request.user
+        profile = self.get_profile()
 
         items = TransactionItem.objects.filter(
-            owner=owner,
+            transaction__profile=profile,
             transaction__date_effective__gte=start,
             transaction__date_effective__lte=end,
         )
         expenses = Transaction.objects.filter(
-            owner=owner,
+            profile=profile,
             type="expense",
             date_effective__gte=start,
             date_effective__lte=end,
@@ -198,20 +191,18 @@ class FinanceAnalyticsView(APIView):
         )
 
 
-class FinanceBreakdownView(APIView):
+class FinanceBreakdownView(ProfileScopedAPIView):
     """
     GET /api/finance/analytics/breakdown/?period=day|week|month&include_archived=0|1
 
     Current calendar period (today / this week Mon–today / this month 1st–today):
       categories — top 5 expense header categories + Other
         (full transaction amount counted in every selected category)
+      totals — period income / expense / transfer_in / transfer_out
       balance_composition — starting_balance vs period expense spend
     """
 
-    permission_classes = [IsAuthenticated, IsEmailVerified]
-
     def get(self, request):
-        ensure_finance_ready(request.user)
         period = request.query_params.get("period", "week")
         if period not in ("day", "week", "month"):
             period = "week"
@@ -225,10 +216,10 @@ class FinanceBreakdownView(APIView):
 
         today = timezone.localdate()
         start, end = _current_period_bounds(period, today)
-        owner = request.user
+        profile = self.get_profile()
 
         expenses = Transaction.objects.filter(
-            owner=owner,
+            profile=profile,
             type="expense",
             date_effective__gte=start,
             date_effective__lte=end,
@@ -287,7 +278,7 @@ class FinanceBreakdownView(APIView):
         parent_ids = {parent for _, parent in meta.values() if parent}
         parents = {
             c.id: c.name
-            for c in Category.objects.filter(owner=owner, id__in=parent_ids).only(
+            for c in Category.objects.filter(profile=profile, id__in=parent_ids).only(
                 "id", "name"
             )
         }
@@ -325,15 +316,32 @@ class FinanceBreakdownView(APIView):
 
         # Sum of pie slices may exceed spent when txns have multiple tags.
         tagged_spend = sum((r["amount"] for r in ranked), Decimal("0.00"))
-        spent = expenses.aggregate(
+
+        type_qs = Transaction.objects.filter(
+            profile=profile,
+            date_effective__gte=start,
+            date_effective__lte=end,
+        )
+        if not include_archived:
+            type_qs = type_qs.filter(status="active")
+        typed = {
+            "income": Decimal("0.00"),
+            "expense": Decimal("0.00"),
+            "transfer_in": Decimal("0.00"),
+            "transfer_out": Decimal("0.00"),
+        }
+        for row in type_qs.values("type").annotate(
             total=Coalesce(
                 Sum("amount"),
                 Value(Decimal("0.00")),
                 output_field=DecimalField(max_digits=14, decimal_places=2),
             )
-        )["total"]
+        ):
+            if row["type"] in typed:
+                typed[row["type"]] = row["total"] or Decimal("0.00")
+        spent = typed["expense"]
 
-        bal = compute_balance(owner)
+        bal = compute_balance(profile)
         starting = bal["starting_balance"] or Decimal("0.00")
 
         return Response(
@@ -344,6 +352,7 @@ class FinanceBreakdownView(APIView):
                 "include_archived": include_archived,
                 "categories": categories,
                 "item_spend": _dec_str(tagged_spend),
+                "totals": {key: _dec_str(val) for key, val in typed.items()},
                 "balance_composition": {
                     "starting_balance": _dec_str(starting),
                     "spent": _dec_str(spent),
