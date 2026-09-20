@@ -5,7 +5,7 @@ from django.urls import include, path, re_path
 from django.views.static import serve
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
-from .spa import spa_index_response
+from .spa import spa_index_response, spa_static_response
 
 # -----------------------------------------------------------------------------
 # API route includes
@@ -44,16 +44,18 @@ if getattr(settings, "DESKTOP_MODE", False):
     def spa_view(_request, *_args, **_kwargs):
         return spa_index_response()
 
+    def spa_static_view(_request, path):
+        return spa_static_response(path)
+
     urlpatterns += [
         path(
             "assets/<path:path>",
             serve,
             {"document_root": frontend_dist / "assets"},
         ),
-        path(
-            "favicon.svg",
-            serve,
-            {"document_root": frontend_dist, "path": "favicon.svg"},
+        re_path(
+            r"^(?P<path>(?!api/|admin/|media/).+\.(?:svg|png|ico|webp|webmanifest|txt|woff2?|map))$",
+            spa_static_view,
         ),
         re_path(r"^(?!api/|admin/|media/).*$", spa_view),
     ]
