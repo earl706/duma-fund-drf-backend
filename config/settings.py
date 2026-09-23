@@ -242,7 +242,8 @@ _TAURI_WEBVIEW_ORIGINS = (
     "http://tauri.localhost",
     "tauri://localhost",
 )
-# ios:dev SPA origin is http://<LAN_IP>:1430; IPA origin is tauri.localhost.
+# DumaFundDev (ios:dev) SPA origin is http://<LAN_IP>:1430;
+# DumaFund UAT IPA origin is tauri.localhost.
 _LAN_ORIGIN_REGEXES = [
     r"^https?://tauri\.localhost$",
     r"^tauri://localhost$",
