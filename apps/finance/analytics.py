@@ -1,5 +1,6 @@
-"""Spend / transaction activity and period breakdown for the dashboard."""
+"""Spend / transaction activity and rolling-window breakdown for the dashboard."""
 
+from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
 
@@ -25,6 +26,12 @@ ITEM_LINE = ExpressionWrapper(
 )
 
 TOP_CATEGORY_SLICES = 5
+OTHER_SLICE_NAME = "Other"
+ROLLING_DAY_WINDOWS = frozenset({7, 28, 60, 120})
+DEFAULT_ROLLING_DAYS = 28
+TYPE_KEYS = ("income", "expense", "transfer_in", "transfer_out")
+INFLOW_TYPES = ("income", "transfer_in")
+OUTFLOW_TYPES = ("expense", "transfer_out")
 
 
 def _parse_date(value, fallback):
@@ -70,10 +77,24 @@ def _iter_periods(start, end, grain):
         cursor = _next_period(cursor, grain)
 
 
-def _current_period_bounds(grain, today=None):
+def _parse_rolling_days(value):
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_ROLLING_DAYS
+    if days not in ROLLING_DAY_WINDOWS:
+        return DEFAULT_ROLLING_DAYS
+    return days
+
+
+def _rolling_bounds(days, today=None):
+    """Inclusive window of `days` calendar days ending today."""
     today = today or timezone.localdate()
-    start = _period_start(today, grain)
-    return start, today
+    return today - timedelta(days=days - 1), today
+
+
+def _empty_type_totals():
+    return {key: Decimal("0.00") for key in TYPE_KEYS}
 
 
 def _dec_str(value):
@@ -84,12 +105,44 @@ def _dec_str(value):
     return str(value.quantize(Decimal("0.01")))
 
 
+def _is_other_slice(name):
+    return (name or "").strip().casefold() == OTHER_SLICE_NAME.casefold()
+
+
+def _pie_categories(ranked):
+    """Top named slices plus one Other bucket (seeded Other + leftovers)."""
+    named = [row for row in ranked if not _is_other_slice(row["name"])]
+    leftover = [row for row in ranked if _is_other_slice(row["name"])]
+    top = named[:TOP_CATEGORY_SLICES]
+    rest = named[TOP_CATEGORY_SLICES:] + leftover
+    other_total = sum((row["amount"] for row in rest), Decimal("0.00"))
+    categories = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "amount": _dec_str(row["amount"]),
+        }
+        for row in top
+    ]
+    if other_total > 0:
+        categories.append(
+            {
+                "id": None,
+                "name": OTHER_SLICE_NAME,
+                "amount": _dec_str(other_total),
+            }
+        )
+    return categories
+
+
 class FinanceAnalyticsView(ProfileScopedAPIView):
     """
     GET /api/finance/analytics/?grain=day|week|month&include_archived=0|1&start=&end=
 
-    Zero-filled points: period, item_spend, txn_count, txn_spend (expense headers).
-    item_spend and txn_spend both bucket by Transaction.date_effective.
+    Zero-filled points bucketed by Transaction.date_effective:
+      money_in = income + transfer_in
+      money_out = expense + transfer_out
+      item_spend, txn_count, txn_spend (expense headers; back-compat)
     """
 
     def get(self, request):
@@ -105,9 +158,9 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
         )
 
         today = timezone.localdate()
-        default_start = today - timedelta(days=29)
+        default_start, default_end = _rolling_bounds(DEFAULT_ROLLING_DAYS, today)
         start = _parse_date(request.query_params.get("start"), default_start)
-        end = _parse_date(request.query_params.get("end"), today)
+        end = _parse_date(request.query_params.get("end"), default_end)
         if start > end:
             start, end = end, start
 
@@ -119,15 +172,14 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
             transaction__date_effective__gte=start,
             transaction__date_effective__lte=end,
         )
-        expenses = Transaction.objects.filter(
+        txns = Transaction.objects.filter(
             profile=profile,
-            type="expense",
             date_effective__gte=start,
             date_effective__lte=end,
         )
         if not include_archived:
             items = items.filter(status="active")
-            expenses = expenses.filter(status="active")
+            txns = txns.filter(status="active")
 
         item_rows = (
             items.annotate(period=trunc("transaction__date_effective"))
@@ -146,37 +198,49 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
             if key is not None:
                 item_map[key] = row["item_spend"]
 
-        txn_rows = (
-            expenses.annotate(period=trunc("date_effective"))
-            .values("period")
+        type_rows = (
+            txns.annotate(period=trunc("date_effective"))
+            .values("period", "type")
             .annotate(
                 txn_count=Count("id"),
-                txn_spend=Coalesce(
+                total=Coalesce(
                     Sum("amount"),
                     Value(Decimal("0.00")),
                     output_field=DecimalField(max_digits=14, decimal_places=2),
                 ),
             )
         )
-        txn_map = {}
-        for row in txn_rows:
+        typed_map = defaultdict(_empty_type_totals)
+        expense_counts = {}
+        for row in type_rows:
             key = _period_start(_as_date(row["period"]), grain)
-            if key is not None:
-                txn_map[key] = row
+            if key is None:
+                continue
+            txn_type = row["type"]
+            if txn_type in typed_map[key]:
+                typed_map[key][txn_type] = row["total"] or Decimal("0.00")
+            if txn_type == "expense":
+                expense_counts[key] = row["txn_count"]
 
         points = []
         for period in _iter_periods(start, end, grain):
-            bucket = txn_map.get(period, {})
+            typed = typed_map.get(period) or _empty_type_totals()
+            expense = typed["expense"]
+            money_in = sum((typed[key] for key in INFLOW_TYPES), Decimal("0.00"))
+            money_out = sum((typed[key] for key in OUTFLOW_TYPES), Decimal("0.00"))
             spend = item_map.get(period, Decimal("0.00"))
+            txn_count = expense_counts.get(period, 0)
             points.append(
                 {
                     "period": period.isoformat(),
                     "item_spend": str(spend),
-                    "txn_count": bucket.get("txn_count", 0),
-                    "txn_spend": str(bucket.get("txn_spend", Decimal("0.00"))),
+                    "txn_count": txn_count,
+                    "txn_spend": _dec_str(expense),
+                    "money_in": _dec_str(money_in),
+                    "money_out": _dec_str(money_out),
                     # Back-compat aliases for existing dashboard labels
-                    "list_count": bucket.get("txn_count", 0),
-                    "list_spend": str(bucket.get("txn_spend", Decimal("0.00"))),
+                    "list_count": txn_count,
+                    "list_spend": _dec_str(expense),
                 }
             )
 
@@ -193,19 +257,17 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
 
 class FinanceBreakdownView(ProfileScopedAPIView):
     """
-    GET /api/finance/analytics/breakdown/?period=day|week|month&include_archived=0|1
+    GET /api/finance/analytics/breakdown/?period=7|28|60|120&include_archived=0|1
 
-    Current calendar period (today / this week Mon–today / this month 1st–today):
-      categories — top 5 expense header categories + Other
-        (full transaction amount counted in every selected category)
-      totals — period income / expense / transfer_in / transfer_out
-      balance_composition — starting_balance vs period expense spend
+    Rolling window of N calendar days ending today (inclusive):
+      categories — top 5 named expense header categories + one Other
+        (seeded Other and leftover names share that bucket; full amount in every tag)
+      totals — window income / expense / transfer_in / transfer_out
+      balance_composition — starting_balance vs window expense spend
     """
 
     def get(self, request):
-        period = request.query_params.get("period", "week")
-        if period not in ("day", "week", "month"):
-            period = "week"
+        period = _parse_rolling_days(request.query_params.get("period"))
 
         include_archived = request.query_params.get("include_archived", "0") in (
             "1",
@@ -215,7 +277,7 @@ class FinanceBreakdownView(ProfileScopedAPIView):
         )
 
         today = timezone.localdate()
-        start, end = _current_period_bounds(period, today)
+        start, end = _rolling_bounds(period, today)
         profile = self.get_profile()
 
         expenses = Transaction.objects.filter(
@@ -293,26 +355,7 @@ class FinanceBreakdownView(ProfileScopedAPIView):
                 name = f"{parents[parent_id]} › {name}"
             ranked.append({"id": cid, "name": name, "amount": amount})
         ranked.sort(key=lambda r: r["amount"], reverse=True)
-
-        top = ranked[:TOP_CATEGORY_SLICES]
-        rest = ranked[TOP_CATEGORY_SLICES:]
-        other_total = sum((r["amount"] for r in rest), Decimal("0.00"))
-        categories = [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "amount": _dec_str(r["amount"]),
-            }
-            for r in top
-        ]
-        if other_total > 0:
-            categories.append(
-                {
-                    "id": None,
-                    "name": "Other",
-                    "amount": _dec_str(other_total),
-                }
-            )
+        categories = _pie_categories(ranked)
 
         # Sum of pie slices may exceed spent when txns have multiple tags.
         tagged_spend = sum((r["amount"] for r in ranked), Decimal("0.00"))

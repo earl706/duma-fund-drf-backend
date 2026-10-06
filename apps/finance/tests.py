@@ -1,7 +1,11 @@
 """Permission tests for budget profiles and sharing."""
 
+from datetime import timedelta
+from decimal import Decimal
+
 from allauth.account.models import EmailAddress
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from .models import (
@@ -11,7 +15,11 @@ from .models import (
     Category,
     Transaction,
 )
-from .seeds import ensure_finance_ready, get_default_expense_category
+from .seeds import (
+    ensure_finance_ready,
+    get_default_expense_category,
+    get_default_income_category,
+)
 
 User = get_user_model()
 
@@ -219,3 +227,115 @@ class ProfileSharingTests(APITestCase):
             results = results.get("results", [])
         titles = [row["title"] for row in results]
         self.assertNotIn("Solo", titles)
+
+
+class FinanceAnalyticsWindowTests(APITestCase):
+    def setUp(self):
+        self.user = make_user("ledger@example.com", "Ledger")
+        self.profile = BudgetProfile.objects.get(owner=self.user)
+        self.client.force_authenticate(self.user)
+        self.headers = {"HTTP_X_BUDGET_PROFILE_ID": str(self.profile.id)}
+        self.expense_cat = get_default_expense_category(self.profile)
+        self.income_cat = get_default_income_category(self.profile)
+        self.today = timezone.localdate()
+
+    def _txn(self, **kwargs):
+        defaults = {
+            "owner": self.user,
+            "profile": self.profile,
+            "title": "row",
+            "date_effective": self.today,
+        }
+        defaults.update(kwargs)
+        return Transaction.objects.create(**defaults)
+
+    def test_breakdown_uses_rolling_days_ending_today(self):
+        self._txn(
+            type="expense",
+            amount=Decimal("40.00"),
+            category=self.expense_cat,
+            date_effective=self.today - timedelta(days=40),
+        )
+        self._txn(
+            type="expense",
+            amount=Decimal("12.50"),
+            category=self.expense_cat,
+            date_effective=self.today,
+        )
+        res = self.client.get(
+            "/api/finance/analytics/breakdown/?period=28",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["period"], 28)
+        self.assertEqual(res.data["end"], self.today.isoformat())
+        self.assertEqual(
+            res.data["start"],
+            (self.today - timedelta(days=27)).isoformat(),
+        )
+        self.assertEqual(res.data["totals"]["expense"], "12.50")
+
+    def test_invalid_period_falls_back_to_28(self):
+        res = self.client.get(
+            "/api/finance/analytics/breakdown/?period=week",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["period"], 28)
+
+    def test_analytics_money_in_out_includes_transfers(self):
+        self._txn(type="income", amount=Decimal("100.00"), category=self.income_cat)
+        self._txn(type="transfer_in", amount=Decimal("20.00"))
+        self._txn(
+            type="expense",
+            amount=Decimal("30.00"),
+            category=self.expense_cat,
+        )
+        self._txn(type="transfer_out", amount=Decimal("5.00"))
+        day = self.today.isoformat()
+        res = self.client.get(
+            f"/api/finance/analytics/?grain=day&start={day}&end={day}",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.data["points"]), 1)
+        point = res.data["points"][0]
+        self.assertEqual(point["money_in"], "120.00")
+        self.assertEqual(point["money_out"], "35.00")
+        self.assertEqual(point["txn_spend"], "30.00")
+
+    def test_breakdown_pie_folds_named_other_into_one_slice(self):
+        cats = {
+            row.name: row
+            for row in Category.objects.filter(
+                profile=self.profile, kind="expense", parent=None
+            )
+        }
+        spend = {
+            "Food": Decimal("100.00"),
+            "Transport": Decimal("90.00"),
+            "Housing": Decimal("80.00"),
+            "Utilities": Decimal("70.00"),
+            "Health": Decimal("60.00"),
+            "Shopping": Decimal("50.00"),
+            "Other": Decimal("40.00"),
+            "Entertainment": Decimal("30.00"),
+        }
+        for name, amount in spend.items():
+            self._txn(
+                type="expense",
+                amount=amount,
+                category=cats[name],
+                title=name,
+            )
+        res = self.client.get(
+            "/api/finance/analytics/breakdown/?period=28",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        names = [row["name"] for row in res.data["categories"]]
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(names.count("Other"), 1)
+        other = next(row for row in res.data["categories"] if row["name"] == "Other")
+        self.assertIsNone(other["id"])
+        self.assertEqual(other["amount"], "120.00")
