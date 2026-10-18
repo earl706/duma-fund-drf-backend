@@ -25,6 +25,7 @@ from .serializers import (
     TransactionSerializer,
     annotate_transaction_amount,
     apply_expense_categories,
+    LINE_TOTAL,
     sync_expense_amount,
 )
 
@@ -170,6 +171,9 @@ class TransactionViewSet(ProfileScopedViewSet):
         "type",
         "amount",
         "status",
+        "merchant",
+        "category",
+        "category__name",
         "date_created",
         "date_effective",
         "date_last_modified",
@@ -219,6 +223,7 @@ class TransactionItemViewSet(ProfileScopedViewSet):
         "cost",
         "quantity",
         "unit",
+        "line_total",
         "date_created",
         "date_last_modified",
         "created_at",
@@ -227,7 +232,9 @@ class TransactionItemViewSet(ProfileScopedViewSet):
 
     def get_queryset(self):
         txn = self._scoped_transaction()
-        return TransactionItem.objects.filter(transaction=txn)
+        return TransactionItem.objects.filter(transaction=txn).annotate(
+            line_total=LINE_TOTAL
+        )
 
     def _scoped_transaction(self):
         try:

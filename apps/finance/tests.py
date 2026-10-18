@@ -14,6 +14,7 @@ from .models import (
     BudgetProfileMembership,
     Category,
     Transaction,
+    TransactionItem,
 )
 from .seeds import (
     ensure_finance_ready,
@@ -339,3 +340,88 @@ class FinanceAnalyticsWindowTests(APITestCase):
         other = next(row for row in res.data["categories"] if row["name"] == "Other")
         self.assertIsNone(other["id"])
         self.assertEqual(other["amount"], "120.00")
+
+
+class FinanceListOrderingTests(APITestCase):
+    def setUp(self):
+        self.user = make_user("sort@example.com", "Sort")
+        self.profile = BudgetProfile.objects.get(owner=self.user)
+        self.client.force_authenticate(self.user)
+        self.headers = {"HTTP_X_BUDGET_PROFILE_ID": str(self.profile.id)}
+        self.food = Category.objects.get(
+            profile=self.profile, name="Food", kind="expense"
+        )
+        self.health = Category.objects.get(
+            profile=self.profile, name="Health", kind="expense"
+        )
+
+    def test_transactions_order_by_merchant_and_category_name(self):
+        Transaction.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            type="expense",
+            title="B",
+            merchant="Zebra",
+            amount=Decimal("1.00"),
+            category=self.health,
+        )
+        Transaction.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            type="expense",
+            title="A",
+            merchant="Apple",
+            amount=Decimal("2.00"),
+            category=self.food,
+        )
+        by_store = self.client.get(
+            "/api/finance/transactions/?ordering=merchant",
+            **self.headers,
+        )
+        self.assertEqual(by_store.status_code, 200)
+        self.assertEqual(
+            [row["merchant"] for row in by_store.data["results"]],
+            ["Apple", "Zebra"],
+        )
+        by_cat = self.client.get(
+            "/api/finance/transactions/?ordering=category__name",
+            **self.headers,
+        )
+        self.assertEqual(by_cat.status_code, 200)
+        self.assertEqual(
+            [row["title"] for row in by_cat.data["results"]],
+            ["A", "B"],
+        )
+
+    def test_items_order_by_line_total(self):
+        txn = Transaction.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            type="expense",
+            title="Cart",
+            amount=Decimal("0.00"),
+            category=self.food,
+        )
+        TransactionItem.objects.create(
+            owner=self.user,
+            transaction=txn,
+            title="cheap",
+            cost=Decimal("1.00"),
+            quantity=Decimal("2.00"),
+        )
+        TransactionItem.objects.create(
+            owner=self.user,
+            transaction=txn,
+            title="pricey",
+            cost=Decimal("5.00"),
+            quantity=Decimal("3.00"),
+        )
+        res = self.client.get(
+            f"/api/finance/transactions/{txn.id}/items/?ordering=-line_total",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(
+            [row["title"] for row in res.data["results"]],
+            ["pricey", "cheap"],
+        )
