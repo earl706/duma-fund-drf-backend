@@ -33,6 +33,7 @@ from .oauth import (
     create_oauth_state,
     exchange_code,
     pop_oauth_state,
+    resolve_oauth_frontend,
 )
 from .email_verification import mark_email_verified
 from .serializers import RememberAwareTokenRefreshSerializer, UserSerializer
@@ -218,7 +219,8 @@ class OAuthStartView(APIView):
     def get(self, request, provider):
         if provider not in PROVIDERS:
             return Response({"detail": "Unknown provider."}, status=404)
-        state = create_oauth_state(cache, provider)
+        frontend = resolve_oauth_frontend(request.GET.get("frontend"))
+        state = create_oauth_state(cache, provider, frontend=frontend)
         return HttpResponseRedirect(authorize_url(provider, state))
 
 
@@ -228,27 +230,24 @@ class OAuthCallbackView(APIView):
     def get(self, request, provider):
         from django.conf import settings
 
+        stashed = pop_oauth_state(cache, request.GET.get("state", ""))
+        frontend = resolve_oauth_frontend(
+            (stashed or {}).get("frontend") or settings.FRONTEND_URL
+        )
         error = request.GET.get("error")
         if error:
-            return HttpResponseRedirect(
-                f"{settings.FRONTEND_URL}/oauth/callback?error={error}"
-            )
-        state = request.GET.get("state", "")
+            return HttpResponseRedirect(f"{frontend}/oauth/callback?error={error}")
         code = request.GET.get("code", "")
-        if pop_oauth_state(cache, state) != provider:
+        if not stashed or stashed.get("provider") != provider:
             return HttpResponseRedirect(
-                f"{settings.FRONTEND_URL}/oauth/callback?error=invalid_state"
+                f"{frontend}/oauth/callback?error=invalid_state"
             )
         try:
             profile = exchange_code(provider, code)
         except Exception:
-            return HttpResponseRedirect(
-                f"{settings.FRONTEND_URL}/oauth/callback?error=oauth_failed"
-            )
+            return HttpResponseRedirect(f"{frontend}/oauth/callback?error=oauth_failed")
         if not profile.get("email"):
-            return HttpResponseRedirect(
-                f"{settings.FRONTEND_URL}/oauth/callback?error=no_email"
-            )
+            return HttpResponseRedirect(f"{frontend}/oauth/callback?error=no_email")
         user = resolve_oauth_user(profile)
         mark_email_verified(user, profile["email"])
         security = get_security(user)
@@ -260,7 +259,7 @@ class OAuthCallbackView(APIView):
             payload = issue_tokens(user, remember=True)
         exchange_code_val = store_oauth_result(payload)
         return HttpResponseRedirect(
-            f"{settings.FRONTEND_URL}/oauth/callback?code={exchange_code_val}"
+            f"{frontend}/oauth/callback?code={exchange_code_val}"
         )
 
 

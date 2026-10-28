@@ -14,23 +14,49 @@ PROVIDERS = {"google", "github"}
 # OAuth state (CSRF) cache helpers
 # -----------------------------------------------------------------------------
 
+_TAURI_FRONTENDS = (
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+    "tauri://localhost",
+)
+
 
 def _state_key(state: str) -> str:
     return f"oauth-state:{state}"
 
 
-def create_oauth_state(cache, provider: str) -> str:
+def allowed_oauth_frontends() -> set[str]:
+    allowed = {settings.FRONTEND_URL.rstrip("/")}
+    allowed.update(origin.rstrip("/") for origin in settings.CORS_ALLOWED_ORIGINS)
+    allowed.update(_TAURI_FRONTENDS)
+    return allowed
+
+
+def resolve_oauth_frontend(requested: str | None) -> str:
+    base = (requested or "").rstrip("/")
+    if base in allowed_oauth_frontends():
+        return base
+    return settings.FRONTEND_URL.rstrip("/")
+
+
+def create_oauth_state(cache, provider: str, frontend: str | None = None) -> str:
     state = secrets.token_urlsafe(32)
-    cache.set(_state_key(state), provider, timeout=600)
+    cache.set(
+        _state_key(state),
+        {"provider": provider, "frontend": frontend},
+        timeout=600,
+    )
     return state
 
 
-def pop_oauth_state(cache, state: str) -> str | None:
+def pop_oauth_state(cache, state: str) -> dict | None:
     key = _state_key(state)
-    provider = cache.get(key)
-    if provider:
+    value = cache.get(key)
+    if value:
         cache.delete(key)
-    return provider
+    if isinstance(value, str):
+        return {"provider": value, "frontend": None}
+    return value
 
 
 # -----------------------------------------------------------------------------

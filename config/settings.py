@@ -63,8 +63,8 @@ CSRF_TRUSTED_ORIGINS = env_list(
     "http://localhost:5173,https://tauri.localhost,http://tauri.localhost",
 )
 
-# iOS LAN prototype: DEBUG runserver (and desktop Gunicorn) accept any Host so
-# DHCP IPs and typed hostnames work. Disable with DJANGO_ALLOW_LAN_HOSTS=false.
+# iOS LAN prototype: DEBUG runserver accepts any Host so DHCP IPs and typed
+# hostnames work. Disable with DJANGO_ALLOW_LAN_HOSTS=false.
 if DEBUG and env_bool("DJANGO_ALLOW_LAN_HOSTS", True) and "*" not in ALLOWED_HOSTS:
     ALLOWED_HOSTS = list(ALLOWED_HOSTS) + ["*"]
 
@@ -265,6 +265,18 @@ if DEBUG:
         CSRF_TRUSTED_ORIGINS,
         ("https://tauri.localhost", "http://tauri.localhost"),
     )
+
+# DumaFund.app (and iOS IPA) SPA origin is tauri.localhost even in production,
+# when the WebView talks to the live VPS API instead of a bundled Gunicorn.
+CORS_ALLOWED_ORIGINS = _extend_unique(CORS_ALLOWED_ORIGINS, _TAURI_WEBVIEW_ORIGINS)
+CORS_ALLOWED_ORIGIN_REGEXES = _extend_unique(
+    CORS_ALLOWED_ORIGIN_REGEXES,
+    (r"^https?://tauri\.localhost$", r"^tauri://localhost$"),
+)
+CSRF_TRUSTED_ORIGINS = _extend_unique(
+    CSRF_TRUSTED_ORIGINS,
+    ("https://tauri.localhost", "http://tauri.localhost"),
+)
 
 FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173")
 
