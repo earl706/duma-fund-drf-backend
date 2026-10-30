@@ -66,6 +66,22 @@ INVITE_STATUS_CHOICES = [
 ]
 
 DEFAULT_PROFILE_NAME = "Personal"
+DEFAULT_CASH_SOURCE_NAME = "Cash"
+
+SOURCE_KIND_CASH = "cash"
+SOURCE_KIND_BANK = "bank"
+SOURCE_KIND_EWALLET = "ewallet"
+
+SOURCE_KIND_CHOICES = [
+    (SOURCE_KIND_CASH, "Cash"),
+    (SOURCE_KIND_BANK, "Bank"),
+    (SOURCE_KIND_EWALLET, "E-wallet"),
+]
+
+PAYEE_CHANNEL_CHOICES = [
+    (SOURCE_KIND_BANK, "Bank"),
+    (SOURCE_KIND_EWALLET, "E-wallet"),
+]
 
 # Expense headers may carry multiple unordered category labels (incl. primary).
 MAX_EXPENSE_CATEGORIES = 5
@@ -81,11 +97,6 @@ class BudgetProfile(TimeStampedModel):
         related_name="owned_budget_profiles",
     )
     name = models.CharField(max_length=100)
-    starting_balance = models.DecimalField(
-        max_digits=14,
-        decimal_places=2,
-        default=Decimal("0.00"),
-    )
 
     class Meta(TimeStampedModel.Meta):
         ordering = ["name", "id"]
@@ -189,12 +200,76 @@ class Category(OwnedModel):
 
 
 # -----------------------------------------------------------------------------
+# Per-profile balance sources (Cash, banks, e-wallets)
+# -----------------------------------------------------------------------------
+class BalanceSource(OwnedModel):
+    profile = models.ForeignKey(
+        BudgetProfile,
+        on_delete=models.CASCADE,
+        related_name="sources",
+    )
+    name = models.CharField(max_length=100)
+    kind = models.CharField(max_length=20, choices=SOURCE_KIND_CHOICES)
+    starting_balance = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
+    is_system = models.BooleanField(default=False)
+
+    class Meta(OwnedModel.Meta):
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "name"],
+                name="finance_source_unique_name_per_profile",
+            ),
+            models.UniqueConstraint(
+                fields=["profile"],
+                condition=Q(kind=SOURCE_KIND_CASH),
+                name="finance_source_one_cash_per_profile",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.kind}:{self.name}"
+
+
+# -----------------------------------------------------------------------------
+# Payees (other people's bank / e-wallet details)
+# -----------------------------------------------------------------------------
+class PaymentContact(OwnedModel):
+    profile = models.ForeignKey(
+        BudgetProfile,
+        on_delete=models.CASCADE,
+        related_name="payees",
+    )
+    display_name = models.CharField(max_length=100)
+    channel = models.CharField(max_length=20, choices=PAYEE_CHANNEL_CHOICES)
+    account_name = models.CharField(max_length=255, blank=True)
+    account_number = models.CharField(max_length=64, blank=True)
+    note = models.TextField(blank=True)
+    qr_image = models.ImageField(upload_to="payees/%Y/%m/", blank=True, null=True)
+
+    class Meta(OwnedModel.Meta):
+        ordering = ["display_name", "id"]
+
+    def __str__(self):
+        return f"{self.display_name} ({self.channel})"
+
+
+# -----------------------------------------------------------------------------
 # Ledger transaction (header)
 # -----------------------------------------------------------------------------
 class Transaction(OwnedModel):
     profile = models.ForeignKey(
         BudgetProfile,
         on_delete=models.CASCADE,
+        related_name="transactions",
+    )
+    source = models.ForeignKey(
+        BalanceSource,
+        on_delete=models.PROTECT,
         related_name="transactions",
     )
     type = models.CharField(max_length=20, choices=TRANSACTION_TYPE_CHOICES)

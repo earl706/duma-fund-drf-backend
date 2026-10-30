@@ -25,7 +25,12 @@ from .models import (
     BudgetProfileInvite,
     BudgetProfileMembership,
 )
-from .seeds import ensure_finance_ready, seed_categories_for_profile
+from .seeds import (
+    ensure_finance_ready,
+    profile_starting_balance,
+    seed_cash_source_for_profile,
+    seed_categories_for_profile,
+)
 
 User = get_user_model()
 
@@ -52,7 +57,7 @@ def serialize_profile(profile, *, role, include_members=False):
         "id": profile.id,
         "uuid": str(profile.uuid),
         "name": profile.name,
-        "starting_balance": str(profile.starting_balance),
+        "starting_balance": str(profile_starting_balance(profile)),
         "role": role,
         "is_owner": role == PROFILE_ROLE_OWNER,
         "owner": _user_payload(profile.owner),
@@ -128,12 +133,8 @@ class ProfileListCreateView(APIView):
         pending_count = BudgetProfileInvite.objects.filter(
             invited_user=request.user, status=INVITE_STATUS_PENDING
         ).count()
-        results = [
-            serialize_profile(m.profile, role=m.role) for m in memberships
-        ]
-        return Response(
-            {"results": results, "pending_invite_count": pending_count}
-        )
+        results = [serialize_profile(m.profile, role=m.role) for m in memberships]
+        return Response({"results": results, "pending_invite_count": pending_count})
 
     def post(self, request):
         ensure_finance_ready(request.user)
@@ -149,12 +150,12 @@ class ProfileListCreateView(APIView):
             profile = BudgetProfile.objects.create(
                 owner=request.user,
                 name=name[:100],
-                starting_balance=starting,
             )
             BudgetProfileMembership.objects.create(
                 profile=profile, user=request.user, role=PROFILE_ROLE_OWNER
             )
             seed_categories_for_profile(profile)
+            seed_cash_source_for_profile(profile, starting_balance=starting)
         return Response(
             serialize_profile(profile, role=PROFILE_ROLE_OWNER),
             status=status.HTTP_201_CREATED,
@@ -181,13 +182,6 @@ class ProfileDetailView(APIView):
             if not name:
                 raise ValidationError({"name": "Name is required."})
             profile.name = name[:100]
-        if "starting_balance" in request.data:
-            try:
-                profile.starting_balance = Decimal(
-                    str(request.data.get("starting_balance") or "0.00")
-                )
-            except (InvalidOperation, TypeError) as exc:
-                raise ValidationError({"starting_balance": "Invalid amount."}) from exc
         profile.save()
         return Response(serialize_profile(profile, role=PROFILE_ROLE_OWNER))
 
@@ -256,7 +250,9 @@ class ProfileMemberListCreateView(APIView):
             invited_user=invitee,
             status=INVITE_STATUS_PENDING,
         ).exists():
-            raise ValidationError({"email": "An invite is already pending for that user."})
+            raise ValidationError(
+                {"email": "An invite is already pending for that user."}
+            )
         invite = BudgetProfileInvite.objects.create(
             profile=profile,
             invited_user=invitee,
@@ -304,7 +300,9 @@ class ProfileMemberDetailView(APIView):
         is_self = user_id == request.user.id
         if is_self:
             if target.role == PROFILE_ROLE_OWNER:
-                raise ValidationError({"detail": "The owner cannot leave this profile."})
+                raise ValidationError(
+                    {"detail": "The owner cannot leave this profile."}
+                )
             target.delete()
             return Response(status=status.HTTP_204_NO_CONTENT)
         if membership.role != PROFILE_ROLE_OWNER:

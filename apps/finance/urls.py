@@ -26,11 +26,19 @@ from .receipt_views import (
     CommitReceiptView,
     ReceiptScanView,
 )
-from .views import CategoryViewSet, TransactionItemViewSet, TransactionViewSet
+from .views import (
+    BalanceSourceViewSet,
+    CategoryViewSet,
+    PaymentContactViewSet,
+    TransactionItemViewSet,
+    TransactionViewSet,
+)
 
 
 router = DefaultRouter()
 router.register("finance/categories", CategoryViewSet, basename="finance-category")
+router.register("finance/sources", BalanceSourceViewSet, basename="finance-source")
+router.register("finance/payees", PaymentContactViewSet, basename="finance-payee")
 router.register(
     "finance/transactions", TransactionViewSet, basename="finance-transaction"
 )

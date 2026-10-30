@@ -7,12 +7,18 @@ from rest_framework.exceptions import ValidationError
 
 from .models import (
     MAX_EXPENSE_CATEGORIES,
+    PAYEE_CHANNEL_CHOICES,
+    SOURCE_KIND_BANK,
+    SOURCE_KIND_CASH,
+    SOURCE_KIND_EWALLET,
     UNIT_CHOICES,
-    BudgetProfile,
+    BalanceSource,
     Category,
+    PaymentContact,
     Transaction,
     TransactionItem,
 )
+from .seeds import get_cash_source
 
 
 def _request_profile(context):
@@ -190,6 +196,126 @@ class CategoryReassignDeleteSerializer(serializers.Serializer):
 
 
 # -----------------------------------------------------------------------------
+# Balance sources
+# -----------------------------------------------------------------------------
+USER_SOURCE_KINDS = (SOURCE_KIND_BANK, SOURCE_KIND_EWALLET)
+
+
+class BalanceSourceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BalanceSource
+        fields = [
+            "id",
+            "uuid",
+            "name",
+            "kind",
+            "starting_balance",
+            "status",
+            "is_system",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "uuid", "is_system", "created_at", "updated_at"]
+
+    def validate_kind(self, value):
+        if self.instance is None and value == SOURCE_KIND_CASH:
+            raise ValidationError("Cash is created automatically; pick bank or e-wallet.")
+        if self.instance is not None and self.instance.is_system and value != self.instance.kind:
+            raise ValidationError("The Cash source kind cannot be changed.")
+        if self.instance is None and value not in USER_SOURCE_KINDS:
+            raise ValidationError("Kind must be bank or ewallet.")
+        return value
+
+    def validate_status(self, value):
+        if (
+            self.instance is not None
+            and self.instance.is_system
+            and value != "active"
+        ):
+            raise ValidationError("Cash cannot be archived.")
+        return value
+
+    def validate_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise ValidationError("Name is required.")
+        if self.instance is not None and self.instance.is_system and name != self.instance.name:
+            raise ValidationError("Cash cannot be renamed.")
+        return name
+
+    def validate(self, attrs):
+        profile = _request_profile(self.context)
+        name = attrs.get("name", getattr(self.instance, "name", None))
+        if name and profile is not None:
+            qs = BalanceSource.objects.filter(profile=profile, name__iexact=name.strip())
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise ValidationError(
+                    {"name": "A source with this name already exists."}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        validated_data["is_system"] = False
+        validated_data["kind"] = validated_data.get("kind") or SOURCE_KIND_EWALLET
+        if validated_data["kind"] == SOURCE_KIND_CASH:
+            raise ValidationError(
+                {"kind": "Cash is created automatically; pick bank or e-wallet."}
+            )
+        return super().create(validated_data)
+
+
+# -----------------------------------------------------------------------------
+# Payees (directory only; not linked to ledger)
+# -----------------------------------------------------------------------------
+class PaymentContactSerializer(serializers.ModelSerializer):
+    qr_image = serializers.ImageField(required=False, allow_null=True)
+    clear_qr = serializers.BooleanField(write_only=True, required=False, default=False)
+
+    class Meta:
+        model = PaymentContact
+        fields = [
+            "id",
+            "uuid",
+            "display_name",
+            "channel",
+            "account_name",
+            "account_number",
+            "note",
+            "qr_image",
+            "clear_qr",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "uuid", "created_at", "updated_at"]
+
+    def validate_display_name(self, value):
+        name = (value or "").strip()
+        if not name:
+            raise ValidationError("Name is required.")
+        return name
+
+    def validate_channel(self, value):
+        allowed = {choice[0] for choice in PAYEE_CHANNEL_CHOICES}
+        if value not in allowed:
+            raise ValidationError("Channel must be bank or ewallet.")
+        return value
+
+    def create(self, validated_data):
+        validated_data.pop("clear_qr", None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        clear_qr = validated_data.pop("clear_qr", False)
+        if clear_qr:
+            if instance.qr_image:
+                instance.qr_image.delete(save=False)
+            validated_data["qr_image"] = None
+        return super().update(instance, validated_data)
+
+
+# -----------------------------------------------------------------------------
 # Transaction items
 # -----------------------------------------------------------------------------
 class TransactionItemSerializer(serializers.ModelSerializer):
@@ -244,6 +370,9 @@ class TransactionSerializer(serializers.ModelSerializer):
     categories = serializers.PrimaryKeyRelatedField(
         many=True, queryset=Category.objects.all(), required=False
     )
+    source = serializers.PrimaryKeyRelatedField(
+        queryset=BalanceSource.objects.all(), required=False
+    )
 
     class Meta:
         model = Transaction
@@ -255,6 +384,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "title",
             "merchant",
             "note",
+            "source",
             "category",
             "categories",
             "receipt_image",
@@ -287,6 +417,10 @@ class TransactionSerializer(serializers.ModelSerializer):
             if profile is not None:
                 qs = qs.filter(profile=profile)
             self.fields["categories"].child_relation.queryset = qs
+            source_qs = BalanceSource.objects.all()
+            if profile is not None:
+                source_qs = source_qs.filter(profile=profile)
+            self.fields["source"].queryset = source_qs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -306,7 +440,6 @@ class TransactionSerializer(serializers.ModelSerializer):
         return data
 
     def validate(self, attrs):
-        request = self.context["request"]
         profile = _request_profile(self.context)
         txn_type = attrs.get("type", getattr(self.instance, "type", None))
         category = attrs.get("category", serializers.empty)
@@ -383,6 +516,16 @@ class TransactionSerializer(serializers.ModelSerializer):
         if amount is not None and amount < 0:
             raise ValidationError({"amount": "Amount must be zero or positive."})
 
+        source = attrs.get("source", serializers.empty)
+        if source is not serializers.empty:
+            if profile is None or source.profile_id != profile.id:
+                raise ValidationError({"source": "Invalid balance source."})
+            keeping = self.instance is not None and self.instance.source_id == source.id
+            if source.status != "active" and not keeping:
+                raise ValidationError({"source": "That source is archived."})
+        elif not self.instance and profile is not None:
+            attrs["source"] = get_cash_source(profile)
+
         return attrs
 
     def create(self, validated_data):
@@ -437,6 +580,7 @@ class CommitBankEntrySerializer(serializers.Serializer):
     note = serializers.CharField(allow_blank=True, required=False, default="")
     date_effective = serializers.DateField(required=False, allow_null=True)
     category_id = serializers.IntegerField(required=False, allow_null=True)
+    source_id = serializers.IntegerField(required=False, allow_null=True)
 
     def validate(self, attrs):
         txn_type = attrs.get("txn_type")
@@ -468,6 +612,7 @@ class CommitReceiptSerializer(serializers.Serializer):
         max_length=MAX_EXPENSE_CATEGORIES,
     )
     date_effective = serializers.DateField(required=False)
+    source_id = serializers.IntegerField(required=False, allow_null=True)
     items = DraftTransactionItemSerializer(many=True, required=False, allow_empty=True)
     entries = CommitBankEntrySerializer(many=True, required=False, allow_empty=True)
 
@@ -526,14 +671,8 @@ class BulkCommitReceiptSerializer(serializers.Serializer):
 
 
 # -----------------------------------------------------------------------------
-# Balance / starting balance
+# Balance
 # -----------------------------------------------------------------------------
-class StartingBalanceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = BudgetProfile
-        fields = ["starting_balance"]
-
-
 class BalanceSerializer(serializers.Serializer):
     starting_balance = serializers.DecimalField(max_digits=14, decimal_places=2)
     balance = serializers.DecimalField(max_digits=14, decimal_places=2)

@@ -5,6 +5,7 @@ from .models import (
     BudgetProfileInvite,
     BudgetProfileMembership,
     Category,
+    PaymentContact,
     PurchaseExclusion,
     PurchaseRegularMark,
     Transaction,
@@ -15,6 +16,7 @@ admin.site.register(BudgetProfile)
 admin.site.register(BudgetProfileMembership)
 admin.site.register(BudgetProfileInvite)
 admin.site.register(Category)
+admin.site.register(PaymentContact)
 admin.site.register(Transaction)
 admin.site.register(TransactionItem)
 admin.site.register(PurchaseRegularMark)

@@ -11,6 +11,7 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 
 from .models import Category, Transaction, TransactionItem, today
+from .seeds import resolve_transaction_source
 from .receipt_scan import scan_receipt_image
 from .scope import LEDGER_WRITE_ROLES, ProfileScopedAPIView
 from .serializers import (
@@ -54,6 +55,8 @@ def parse_commit_payload(data):
                 row.pop("date_effective", None)
             if row.get("category_id") in ("", None):
                 row.pop("category_id", None)
+            if row.get("source_id") in ("", None):
+                row.pop("source_id", None)
             cleaned_entries.append(row)
         entries = cleaned_entries
 
@@ -81,6 +84,9 @@ def parse_commit_payload(data):
     date_effective = data.get("date_effective")
     if date_effective:
         payload["date_effective"] = date_effective
+    source_id = data.get("source_id")
+    if source_id not in ("", None):
+        payload["source_id"] = source_id
     return payload
 
 
@@ -280,6 +286,9 @@ class CommitReceiptMixin:
         merchant = (payload.get("merchant") or payload.get("title") or "").strip()
         title = (payload.get("title") or merchant or "Receipt").strip()
         note = payload.get("note") or ""
+        source = resolve_transaction_source(
+            profile, source_id=payload.get("source_id"), merchant=merchant
+        )
 
         with db_transaction.atomic():
             txn = Transaction.objects.create(
@@ -290,6 +299,7 @@ class CommitReceiptMixin:
                 title=title,
                 merchant=merchant,
                 note=note,
+                source=source,
                 category=header_cat,
                 date_created=today(),
                 date_effective=effective,
@@ -343,6 +353,11 @@ class CommitReceiptMixin:
                     if txn_type == "income"
                     else None
                 )
+                source = resolve_transaction_source(
+                    profile,
+                    source_id=entry.get("source_id"),
+                    merchant=merchant,
+                )
                 txn = Transaction.objects.create(
                     owner=owner,
                     profile=profile,
@@ -351,6 +366,7 @@ class CommitReceiptMixin:
                     title=title,
                     merchant=merchant,
                     note=note,
+                    source=source,
                     category=category,
                     date_created=today(),
                     date_effective=effective,

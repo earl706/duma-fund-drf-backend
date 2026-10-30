@@ -7,7 +7,9 @@ from rest_framework.response import Response
 
 from .models import (
     PROFILE_ROLE_OWNER,
+    BalanceSource,
     Category,
+    PaymentContact,
     Transaction,
     TransactionItem,
 )
@@ -19,8 +21,10 @@ from .scope import (
     resolve_profile,
 )
 from .serializers import (
+    BalanceSourceSerializer,
     CategoryReassignDeleteSerializer,
     CategorySerializer,
+    PaymentContactSerializer,
     TransactionItemSerializer,
     TransactionSerializer,
     annotate_transaction_amount,
@@ -159,12 +163,82 @@ class CategoryViewSet(ProfileScopedViewSet):
 
 
 # -----------------------------------------------------------------------------
+# Balance sources (owner-only writes)
+# -----------------------------------------------------------------------------
+class BalanceSourceViewSet(ProfileScopedViewSet):
+    serializer_class = BalanceSourceSerializer
+    queryset = BalanceSource.objects.all()
+    filterset_fields = ["kind", "status", "is_system"]
+    search_fields = ["name"]
+    ordering_fields = ["name", "kind", "created_at"]
+    write_roles = OWNER_ONLY_ROLES
+
+    def get_queryset(self):
+        from django.db.models import Case, IntegerField, When
+
+        return (
+            super()
+            .get_queryset()
+            .annotate(
+                _kind_order=Case(
+                    When(kind="cash", then=0),
+                    When(kind="bank", then=1),
+                    When(kind="ewallet", then=2),
+                    default=3,
+                    output_field=IntegerField(),
+                )
+            )
+            .order_by("_kind_order", "name", "id")
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(
+            owner=self.request.user,
+            profile=self.get_profile(),
+            is_system=False,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
+        source = self.get_object()
+        if source.is_system or source.kind == "cash":
+            raise ValidationError({"detail": "Cash cannot be deleted."})
+        if source.transactions.exists():
+            raise ValidationError(
+                {
+                    "detail": (
+                        "This source has transactions. Archive it instead of deleting."
+                    )
+                }
+            )
+        return super().destroy(request, *args, **kwargs)
+
+
+# -----------------------------------------------------------------------------
+# Payees (owner + editor write; viewers read)
+# -----------------------------------------------------------------------------
+class PaymentContactViewSet(ProfileScopedViewSet):
+    serializer_class = PaymentContactSerializer
+    queryset = PaymentContact.objects.all()
+    filterset_fields = ["channel"]
+    search_fields = ["display_name", "account_name", "account_number", "note"]
+    ordering_fields = ["display_name", "channel", "created_at"]
+    write_roles = LEDGER_WRITE_ROLES
+
+    def get_queryset(self):
+        return super().get_queryset().order_by("display_name", "id")
+
+    def perform_create(self, serializer):
+        serializer.save(owner=self.request.user, profile=self.get_profile())
+
+
+# -----------------------------------------------------------------------------
 # Transactions
 # -----------------------------------------------------------------------------
 class TransactionViewSet(ProfileScopedViewSet):
     serializer_class = TransactionSerializer
     queryset = Transaction.objects.all()
-    filterset_fields = ["type", "status", "date_effective", "date_created"]
+    filterset_fields = ["type", "status", "date_effective", "date_created", "source"]
     search_fields = ["title", "note", "merchant"]
     ordering_fields = [
         "title",
@@ -179,6 +253,8 @@ class TransactionViewSet(ProfileScopedViewSet):
         "date_last_modified",
         "created_at",
         "updated_at",
+        "source",
+        "source__name",
     ]
     write_roles = LEDGER_WRITE_ROLES
 
@@ -186,7 +262,7 @@ class TransactionViewSet(ProfileScopedViewSet):
         qs = (
             annotate_transaction_amount(super().get_queryset())
             .annotate(item_count=Count("items", distinct=True))
-            .select_related("category")
+            .select_related("category", "source")
             .prefetch_related("categories")
         )
         category = self.request.query_params.get("category")

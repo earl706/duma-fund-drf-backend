@@ -2,22 +2,27 @@
 
 from datetime import timedelta
 from decimal import Decimal
+from io import BytesIO
 
 from allauth.account.models import EmailAddress
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from .models import (
+    BalanceSource,
     BudgetProfile,
     BudgetProfileInvite,
     BudgetProfileMembership,
     Category,
+    PaymentContact,
     Transaction,
     TransactionItem,
 )
 from .seeds import (
     ensure_finance_ready,
+    get_cash_source,
     get_default_expense_category,
     get_default_income_category,
 )
@@ -131,8 +136,9 @@ class ProfileSharingTests(APITestCase):
         )
         self.assertEqual(cat_write.status_code, 403)
 
+        cash = BalanceSource.objects.get(profile_id=family_id, kind="cash")
         start = self.client.patch(
-            "/api/finance/balance/",
+            f"/api/finance/sources/{cash.id}/",
             {"starting_balance": "99.00"},
             format="json",
             **hdr,
@@ -175,8 +181,9 @@ class ProfileSharingTests(APITestCase):
         )
         self.assertEqual(cat_write.status_code, 403)
 
+        cash = BalanceSource.objects.get(profile_id=family_id, kind="cash")
         start = self.client.patch(
-            "/api/finance/balance/",
+            f"/api/finance/sources/{cash.id}/",
             {"starting_balance": "50.00"},
             format="json",
             **hdr,
@@ -244,6 +251,7 @@ class FinanceAnalyticsWindowTests(APITestCase):
         defaults = {
             "owner": self.user,
             "profile": self.profile,
+            "source": get_cash_source(self.profile),
             "title": "row",
             "date_effective": self.today,
         }
@@ -356,9 +364,11 @@ class FinanceListOrderingTests(APITestCase):
         )
 
     def test_transactions_order_by_merchant_and_category_name(self):
+        cash = get_cash_source(self.profile)
         Transaction.objects.create(
             owner=self.user,
             profile=self.profile,
+            source=cash,
             type="expense",
             title="B",
             merchant="Zebra",
@@ -368,6 +378,7 @@ class FinanceListOrderingTests(APITestCase):
         Transaction.objects.create(
             owner=self.user,
             profile=self.profile,
+            source=cash,
             type="expense",
             title="A",
             merchant="Apple",
@@ -397,6 +408,7 @@ class FinanceListOrderingTests(APITestCase):
         txn = Transaction.objects.create(
             owner=self.user,
             profile=self.profile,
+            source=get_cash_source(self.profile),
             type="expense",
             title="Cart",
             amount=Decimal("0.00"),
@@ -425,3 +437,296 @@ class FinanceListOrderingTests(APITestCase):
             [row["title"] for row in res.data["results"]],
             ["pricey", "cheap"],
         )
+
+
+class BalanceSourceTests(APITestCase):
+    def setUp(self):
+        self.owner = make_user("wallet@example.com", "Wallet")
+        self.editor = make_user("editor@example.com", "Editor")
+        self.profile = BudgetProfile.objects.get(owner=self.owner)
+        self.client.force_authenticate(self.owner)
+        self.headers = {"HTTP_X_BUDGET_PROFILE_ID": str(self.profile.id)}
+        self.cash = get_cash_source(self.profile)
+        self.expense_cat = get_default_expense_category(self.profile)
+        self.income_cat = get_default_income_category(self.profile)
+
+    def test_personal_seeds_cash(self):
+        self.assertEqual(self.cash.name, "Cash")
+        self.assertTrue(self.cash.is_system)
+        res = self.client.get("/api/finance/sources/", **self.headers)
+        self.assertEqual(res.status_code, 200)
+        names = [row["name"] for row in res.data["results"]]
+        self.assertEqual(names, ["Cash"])
+
+    def test_create_profile_starting_balance_goes_to_cash(self):
+        created = self.client.post(
+            "/api/finance/profiles/",
+            {"name": "Biz", "starting_balance": "150.00"},
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["starting_balance"], "150.00")
+        cash = BalanceSource.objects.get(profile_id=created.data["id"], kind="cash")
+        self.assertEqual(cash.starting_balance, Decimal("150.00"))
+
+    def test_default_source_on_transaction_create(self):
+        created = self.client.post(
+            "/api/finance/transactions/",
+            {
+                "type": "expense",
+                "title": "Coffee",
+                "amount": "4.50",
+                "category": self.expense_cat.id,
+                "categories": [self.expense_cat.id],
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["source"], self.cash.id)
+
+    def test_per_source_balance_math(self):
+        gcash = self.client.post(
+            "/api/finance/sources/",
+            {"name": "GCash", "kind": "ewallet", "starting_balance": "20.00"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(gcash.status_code, 201)
+        gcash_id = gcash.data["id"]
+        self.client.patch(
+            f"/api/finance/sources/{self.cash.id}/",
+            {"starting_balance": "100.00"},
+            format="json",
+            **self.headers,
+        )
+        self.client.post(
+            "/api/finance/transactions/",
+            {
+                "type": "expense",
+                "title": "Cash spend",
+                "amount": "10.00",
+                "category": self.expense_cat.id,
+                "source": self.cash.id,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.client.post(
+            "/api/finance/transactions/",
+            {
+                "type": "income",
+                "title": "Wallet in",
+                "amount": "5.00",
+                "category": self.income_cat.id,
+                "source": gcash_id,
+            },
+            format="json",
+            **self.headers,
+        )
+        self.client.post(
+            "/api/finance/transactions/",
+            {
+                "type": "transfer_out",
+                "title": "Send",
+                "amount": "3.00",
+                "source": gcash_id,
+            },
+            format="json",
+            **self.headers,
+        )
+        bal = self.client.get("/api/finance/balance/", **self.headers)
+        self.assertEqual(bal.status_code, 200)
+        self.assertEqual(bal.data["starting_balance"], "120.00")
+        self.assertEqual(bal.data["balance"], "112.00")
+        by_name = {row["name"]: row for row in bal.data["sources"]}
+        self.assertEqual(by_name["Cash"]["balance"], "90.00")
+        self.assertEqual(by_name["GCash"]["balance"], "22.00")
+
+    def test_cannot_create_or_delete_cash(self):
+        created = self.client.post(
+            "/api/finance/sources/",
+            {"name": "Petty", "kind": "cash"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 400)
+        deleted = self.client.delete(
+            f"/api/finance/sources/{self.cash.id}/",
+            **self.headers,
+        )
+        self.assertEqual(deleted.status_code, 400)
+        archived = self.client.patch(
+            f"/api/finance/sources/{self.cash.id}/",
+            {"status": "archived"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(archived.status_code, 400)
+
+    def test_delete_unused_source_archives_in_use(self):
+        bank = self.client.post(
+            "/api/finance/sources/",
+            {"name": "BPI", "kind": "bank"},
+            format="json",
+            **self.headers,
+        )
+        bank_id = bank.data["id"]
+        self.client.post(
+            "/api/finance/transactions/",
+            {
+                "type": "transfer_in",
+                "title": "Payroll",
+                "amount": "50.00",
+                "source": bank_id,
+            },
+            format="json",
+            **self.headers,
+        )
+        blocked = self.client.delete(
+            f"/api/finance/sources/{bank_id}/",
+            **self.headers,
+        )
+        self.assertEqual(blocked.status_code, 400)
+        extra = self.client.post(
+            "/api/finance/sources/",
+            {"name": "Maya", "kind": "ewallet"},
+            format="json",
+            **self.headers,
+        )
+        gone = self.client.delete(
+            f"/api/finance/sources/{extra.data['id']}/",
+            **self.headers,
+        )
+        self.assertEqual(gone.status_code, 204)
+
+    def test_editor_cannot_manage_sources(self):
+        invited = self.client.post(
+            f"/api/finance/profiles/{self.profile.id}/members/",
+            {"email": self.editor.email, "role": "editor"},
+            format="json",
+        )
+        self.client.force_authenticate(self.editor)
+        self.client.post(f"/api/finance/invites/{invited.data['id']}/accept/")
+        listed = self.client.get("/api/finance/sources/", **self.headers)
+        self.assertEqual(listed.status_code, 200)
+        created = self.client.post(
+            "/api/finance/sources/",
+            {"name": "Maya", "kind": "ewallet"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 403)
+
+
+def _tiny_png():
+    from PIL import Image
+
+    buf = BytesIO()
+    Image.new("RGB", (1, 1), color=(0, 0, 0)).save(buf, format="PNG")
+    return SimpleUploadedFile("qr.png", buf.getvalue(), content_type="image/png")
+
+
+class PaymentContactTests(APITestCase):
+    def setUp(self):
+        self.owner = make_user("payee-owner@example.com", "Owner")
+        self.editor = make_user("payee-editor@example.com", "Editor")
+        self.viewer = make_user("payee-viewer@example.com", "Viewer")
+        self.profile = BudgetProfile.objects.get(owner=self.owner)
+        self.client.force_authenticate(self.owner)
+        self.headers = {"HTTP_X_BUDGET_PROFILE_ID": str(self.profile.id)}
+
+    def _invite(self, user, role):
+        invited = self.client.post(
+            f"/api/finance/profiles/{self.profile.id}/members/",
+            {"email": user.email, "role": role},
+            format="json",
+        )
+        self.assertEqual(invited.status_code, 201)
+        self.client.force_authenticate(user)
+        accepted = self.client.post(f"/api/finance/invites/{invited.data['id']}/accept/")
+        self.assertEqual(accepted.status_code, 200)
+        self.client.force_authenticate(self.owner)
+        return invited.data["id"]
+
+    def test_editor_can_create_and_list(self):
+        self._invite(self.editor, "editor")
+        self.client.force_authenticate(self.editor)
+        created = self.client.post(
+            "/api/finance/payees/",
+            {
+                "display_name": "Ana",
+                "channel": "ewallet",
+                "account_name": "Ana Cruz",
+                "account_number": "09171234567",
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["display_name"], "Ana")
+        self.assertEqual(created.data["channel"], "ewallet")
+        listed = self.client.get("/api/finance/payees/", **self.headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.data["results"][0]["account_number"], "09171234567")
+
+    def test_viewer_can_read_but_not_write(self):
+        self.client.post(
+            "/api/finance/payees/",
+            {
+                "display_name": "Ben",
+                "channel": "bank",
+                "account_number": "1234",
+            },
+            format="json",
+            **self.headers,
+        )
+        self._invite(self.viewer, "viewer")
+        self.client.force_authenticate(self.viewer)
+        listed = self.client.get("/api/finance/payees/", **self.headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.data["results"][0]["display_name"], "Ben")
+        created = self.client.post(
+            "/api/finance/payees/",
+            {"display_name": "Cara", "channel": "bank"},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 403)
+
+    def test_owner_can_delete(self):
+        created = self.client.post(
+            "/api/finance/payees/",
+            {"display_name": "Dan", "channel": "bank"},
+            format="json",
+            **self.headers,
+        )
+        gone = self.client.delete(
+            f"/api/finance/payees/{created.data['id']}/",
+            **self.headers,
+        )
+        self.assertEqual(gone.status_code, 204)
+        self.assertFalse(PaymentContact.objects.filter(pk=created.data["id"]).exists())
+
+    def test_qr_upload_and_clear(self):
+        created = self.client.post(
+            "/api/finance/payees/",
+            {
+                "display_name": "Eli",
+                "channel": "ewallet",
+                "qr_image": _tiny_png(),
+            },
+            format="multipart",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertTrue(created.data["qr_image"])
+        payee_id = created.data["id"]
+        cleared = self.client.patch(
+            f"/api/finance/payees/{payee_id}/",
+            {"clear_qr": True},
+            format="multipart",
+            **self.headers,
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertIsNone(cleared.data["qr_image"])
