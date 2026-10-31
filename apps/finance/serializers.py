@@ -195,6 +195,10 @@ class CategoryReassignDeleteSerializer(serializers.Serializer):
     target_category_id = serializers.IntegerField()
 
 
+class SourceReassignDeleteSerializer(serializers.Serializer):
+    target_source_id = serializers.IntegerField()
+
+
 # -----------------------------------------------------------------------------
 # Balance sources
 # -----------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 from decimal import Decimal
 
-from django.db.models import Case, IntegerField, Sum, Value, When
+from django.db.models import Case, Count, IntegerField, Sum, Value, When
 from django.db.models.functions import Coalesce
 from rest_framework.response import Response
 
@@ -64,6 +64,11 @@ def compute_balance(profile):
         if row["type"] in bucket:
             bucket[row["type"]] = row["total"] or Decimal("0.00")
 
+    txn_counts = {
+        row["source_id"]: row["c"]
+        for row in txn_qs.values("source_id").annotate(c=Count("id"))
+    }
+
     source_rows = []
     profile_totals = _zero_totals()
     for src in sources:
@@ -82,6 +87,7 @@ def compute_balance(profile):
                 "starting_balance": starting,
                 "balance": _net_from_totals(starting, totals),
                 "totals": totals,
+                "transaction_count": int(txn_counts.get(src.id, 0)),
             }
         )
 

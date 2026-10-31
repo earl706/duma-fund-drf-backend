@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -93,3 +94,10 @@ class MeView(APIView):
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+    def delete(self, request):
+        """Hard-delete the account and CASCADE-owned data (Apple account deletion)."""
+        user = request.user
+        with transaction.atomic():
+            user.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

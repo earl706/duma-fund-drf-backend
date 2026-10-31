@@ -25,6 +25,7 @@ from .serializers import (
     CategoryReassignDeleteSerializer,
     CategorySerializer,
     PaymentContactSerializer,
+    SourceReassignDeleteSerializer,
     TransactionItemSerializer,
     TransactionSerializer,
     annotate_transaction_amount,
@@ -198,6 +199,38 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
             is_system=False,
         )
 
+    @action(detail=True, methods=["post"], url_path="reassign-and-delete")
+    def reassign_and_delete(self, request, pk=None):
+        require_role(self.get_membership(), PROFILE_ROLE_OWNER)
+        source = self.get_object()
+        if source.is_system or source.kind == "cash":
+            raise ValidationError({"detail": "Cash cannot be deleted."})
+
+        ser = SourceReassignDeleteSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        target_id = ser.validated_data["target_source_id"]
+        profile = self.get_profile()
+        try:
+            target = BalanceSource.objects.get(pk=target_id, profile=profile)
+        except BalanceSource.DoesNotExist as exc:
+            raise ValidationError(
+                {"target_source_id": "Target source not found."}
+            ) from exc
+        if target.pk == source.pk:
+            raise ValidationError(
+                {"target_source_id": "Choose a different source."}
+            )
+        if target.status != "active":
+            raise ValidationError(
+                {"target_source_id": "Target source must be active."}
+            )
+
+        with db_transaction.atomic():
+            Transaction.objects.filter(source=source).update(source=target)
+            source.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     def destroy(self, request, *args, **kwargs):
         require_role(self.get_membership(), PROFILE_ROLE_OWNER)
         source = self.get_object()
@@ -207,7 +240,8 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
             raise ValidationError(
                 {
                     "detail": (
-                        "This source has transactions. Archive it instead of deleting."
+                        "This source has transactions. Use reassign-and-delete "
+                        "with a target_source_id (usually Cash)."
                     )
                 }
             )

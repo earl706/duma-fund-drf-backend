@@ -588,6 +588,18 @@ class BalanceSourceTests(APITestCase):
             **self.headers,
         )
         self.assertEqual(blocked.status_code, 400)
+        moved = self.client.post(
+            f"/api/finance/sources/{bank_id}/reassign-and-delete/",
+            {"target_source_id": self.cash.id},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(moved.status_code, 204)
+        self.assertFalse(BalanceSource.objects.filter(id=bank_id).exists())
+        self.assertEqual(
+            Transaction.objects.filter(source=self.cash, title="Payroll").count(),
+            1,
+        )
         extra = self.client.post(
             "/api/finance/sources/",
             {"name": "Maya", "kind": "ewallet"},
