@@ -1,9 +1,10 @@
-"""Derived per-source and profile balance."""
+"""Derived per-source and profile balance (as-of today; future separate)."""
 
 from decimal import Decimal
 
 from django.db.models import Case, Count, IntegerField, Sum, Value, When
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework.response import Response
 
 from .models import BalanceSource, Transaction
@@ -12,6 +13,8 @@ from .seeds import profile_starting_balance
 
 
 TYPE_KEYS = ("income", "expense", "transfer_in", "transfer_out")
+INFLOW_TYPES = ("income", "transfer_in")
+OUTFLOW_TYPES = ("expense", "transfer_out")
 
 
 def _zero_totals():
@@ -38,6 +41,10 @@ def _net_from_totals(starting, totals):
     )
 
 
+def _flow_sum(totals, keys):
+    return sum((totals[key] for key in keys), Decimal("0.00"))
+
+
 def _source_kind_order():
     return Case(
         When(kind="cash", then=0),
@@ -48,13 +55,23 @@ def _source_kind_order():
     )
 
 
-def compute_balance(profile):
+def compute_balance(profile, as_of=None):
+    """
+    Available balance uses active transactions with date_effective <= as_of
+    (default today). Future active rows contribute upcoming_in / upcoming_out
+    and projected_balance (= available + upcoming_in − upcoming_out).
+    """
+    as_of = as_of or timezone.localdate()
     sources = list(
         BalanceSource.objects.filter(profile=profile)
         .annotate(_kind_order=_source_kind_order())
         .order_by("_kind_order", "name", "id")
     )
-    txn_qs = Transaction.objects.filter(profile=profile)
+    txn_qs = Transaction.objects.filter(
+        profile=profile,
+        status="active",
+        date_effective__lte=as_of,
+    )
     by_source = {}
     for row in txn_qs.values("source_id", "type").annotate(
         total=Coalesce(Sum("amount"), Value(Decimal("0.00")))
@@ -92,11 +109,28 @@ def compute_balance(profile):
         )
 
     starting = profile_starting_balance(profile) or Decimal("0.00")
+    available = _net_from_totals(starting, profile_totals)
+
+    upcoming_qs = Transaction.objects.filter(
+        profile=profile,
+        status="active",
+        date_effective__gt=as_of,
+    )
+    upcoming_totals = _typed_sums(upcoming_qs)
+    upcoming_in = _flow_sum(upcoming_totals, INFLOW_TYPES)
+    upcoming_out = _flow_sum(upcoming_totals, OUTFLOW_TYPES)
+    projected = available + upcoming_in - upcoming_out
+
     return {
+        "as_of": as_of,
         "starting_balance": starting,
-        "balance": _net_from_totals(starting, profile_totals),
+        "balance": available,
         "totals": profile_totals,
         "sources": source_rows,
+        "upcoming_in": upcoming_in,
+        "upcoming_out": upcoming_out,
+        "upcoming_totals": upcoming_totals,
+        "projected_balance": projected,
     }
 
 
@@ -109,15 +143,22 @@ def _dec_str(value):
 
 
 class BalanceView(ProfileScopedAPIView):
-    """GET derived profile + per-source balances."""
+    """GET derived profile + per-source balances (as-of today)."""
 
     def get(self, request):
         data = compute_balance(self.get_profile())
         return Response(
             {
+                "as_of": data["as_of"].isoformat(),
                 "starting_balance": _dec_str(data["starting_balance"]),
                 "balance": _dec_str(data["balance"]),
                 "totals": {k: _dec_str(v) for k, v in data["totals"].items()},
+                "upcoming_in": _dec_str(data["upcoming_in"]),
+                "upcoming_out": _dec_str(data["upcoming_out"]),
+                "upcoming_totals": {
+                    k: _dec_str(v) for k, v in data["upcoming_totals"].items()
+                },
+                "projected_balance": _dec_str(data["projected_balance"]),
                 "sources": [
                     {
                         **row,

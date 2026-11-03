@@ -349,6 +349,108 @@ class FinanceAnalyticsWindowTests(APITestCase):
         self.assertIsNone(other["id"])
         self.assertEqual(other["amount"], "120.00")
 
+    def test_breakdown_future_direction_excludes_today(self):
+        self._txn(
+            type="expense",
+            amount=Decimal("10.00"),
+            category=self.expense_cat,
+            date_effective=self.today,
+        )
+        self._txn(
+            type="expense",
+            amount=Decimal("25.00"),
+            category=self.expense_cat,
+            date_effective=self.today + timedelta(days=3),
+            title="Future rent",
+        )
+        self._txn(
+            type="income",
+            amount=Decimal("50.00"),
+            category=self.income_cat,
+            date_effective=self.today + timedelta(days=5),
+            title="Future pay",
+        )
+        res = self.client.get(
+            "/api/finance/analytics/breakdown/?period=28&direction=future",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["direction"], "future")
+        self.assertEqual(
+            res.data["start"],
+            (self.today + timedelta(days=1)).isoformat(),
+        )
+        self.assertEqual(
+            res.data["end"],
+            (self.today + timedelta(days=28)).isoformat(),
+        )
+        self.assertEqual(res.data["totals"]["expense"], "25.00")
+        self.assertEqual(res.data["totals"]["income"], "50.00")
+
+    def test_balance_excludes_future_and_reports_projected(self):
+        cash = get_cash_source(self.profile)
+        cash.starting_balance = Decimal("100.00")
+        cash.save(update_fields=["starting_balance"])
+        self._txn(
+            type="expense",
+            amount=Decimal("20.00"),
+            category=self.expense_cat,
+            date_effective=self.today,
+        )
+        self._txn(
+            type="expense",
+            amount=Decimal("30.00"),
+            category=self.expense_cat,
+            date_effective=self.today + timedelta(days=7),
+            title="Upcoming",
+        )
+        self._txn(
+            type="income",
+            amount=Decimal("15.00"),
+            category=self.income_cat,
+            date_effective=self.today + timedelta(days=2),
+            title="Upcoming in",
+        )
+        archived = self._txn(
+            type="expense",
+            amount=Decimal("99.00"),
+            category=self.expense_cat,
+            date_effective=self.today,
+            title="Archived",
+            status="archived",
+        )
+        self.assertEqual(archived.status, "archived")
+        res = self.client.get("/api/finance/balance/", **self.headers)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.data["as_of"], self.today.isoformat())
+        self.assertEqual(res.data["balance"], "80.00")
+        self.assertEqual(res.data["upcoming_out"], "30.00")
+        self.assertEqual(res.data["upcoming_in"], "15.00")
+        self.assertEqual(res.data["projected_balance"], "65.00")
+
+    def test_transactions_date_effective_gt_filter(self):
+        self._txn(
+            type="expense",
+            amount=Decimal("1.00"),
+            category=self.expense_cat,
+            date_effective=self.today,
+            title="Today",
+        )
+        self._txn(
+            type="expense",
+            amount=Decimal("2.00"),
+            category=self.expense_cat,
+            date_effective=self.today + timedelta(days=1),
+            title="Tomorrow",
+        )
+        res = self.client.get(
+            f"/api/finance/transactions/?date_effective__gt={self.today.isoformat()}",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        titles = [row["title"] for row in res.data["results"]]
+        self.assertEqual(titles, ["Tomorrow"])
+
 
 class FinanceListOrderingTests(APITestCase):
     def setUp(self):

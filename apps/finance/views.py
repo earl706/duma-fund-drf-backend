@@ -217,13 +217,9 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
                 {"target_source_id": "Target source not found."}
             ) from exc
         if target.pk == source.pk:
-            raise ValidationError(
-                {"target_source_id": "Choose a different source."}
-            )
+            raise ValidationError({"target_source_id": "Choose a different source."})
         if target.status != "active":
-            raise ValidationError(
-                {"target_source_id": "Target source must be active."}
-            )
+            raise ValidationError({"target_source_id": "Target source must be active."})
 
         with db_transaction.atomic():
             Transaction.objects.filter(source=source).update(source=target)
@@ -272,7 +268,13 @@ class PaymentContactViewSet(ProfileScopedViewSet):
 class TransactionViewSet(ProfileScopedViewSet):
     serializer_class = TransactionSerializer
     queryset = Transaction.objects.all()
-    filterset_fields = ["type", "status", "date_effective", "date_created", "source"]
+    filterset_fields = {
+        "type": ["exact"],
+        "status": ["exact"],
+        "date_effective": ["exact", "gt", "gte", "lt", "lte"],
+        "date_created": ["exact", "gt", "gte", "lt", "lte"],
+        "source": ["exact"],
+    }
     search_fields = ["title", "note", "merchant"]
     ordering_fields = [
         "title",

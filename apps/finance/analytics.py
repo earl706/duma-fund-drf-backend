@@ -87,9 +87,22 @@ def _parse_rolling_days(value):
     return days
 
 
-def _rolling_bounds(days, today=None):
-    """Inclusive window of `days` calendar days ending today."""
+def _parse_direction(value):
+    direction = (value or "past").strip().lower()
+    if direction not in ("past", "future"):
+        return "past"
+    return direction
+
+
+def _rolling_bounds(days, today=None, direction="past"):
+    """
+    Inclusive window of `days` calendar days.
+    past   — [today − (days − 1), today]
+    future — [today + 1, today + days]
+    """
     today = today or timezone.localdate()
+    if direction == "future":
+        return today + timedelta(days=1), today + timedelta(days=days)
     return today - timedelta(days=days - 1), today
 
 
@@ -257,17 +270,21 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
 
 class FinanceBreakdownView(ProfileScopedAPIView):
     """
-    GET /api/finance/analytics/breakdown/?period=7|28|60|120&include_archived=0|1
+    GET /api/finance/analytics/breakdown/
+      ?period=7|28|60|120&direction=past|future&include_archived=0|1
 
-    Rolling window of N calendar days ending today (inclusive):
+    Rolling window of N calendar days:
+      past (default) — ending today inclusive
+      future — tomorrow through today+N
       categories — top 5 named expense header categories + one Other
         (seeded Other and leftover names share that bucket; full amount in every tag)
       totals — window income / expense / transfer_in / transfer_out
-      balance_composition — starting_balance vs window expense spend
+      balance_composition — as-of starting_balance vs window expense spend
     """
 
     def get(self, request):
         period = _parse_rolling_days(request.query_params.get("period"))
+        direction = _parse_direction(request.query_params.get("direction"))
 
         include_archived = request.query_params.get("include_archived", "0") in (
             "1",
@@ -277,7 +294,7 @@ class FinanceBreakdownView(ProfileScopedAPIView):
         )
 
         today = timezone.localdate()
-        start, end = _rolling_bounds(period, today)
+        start, end = _rolling_bounds(period, today, direction=direction)
         profile = self.get_profile()
 
         expenses = Transaction.objects.filter(
@@ -390,6 +407,7 @@ class FinanceBreakdownView(ProfileScopedAPIView):
         return Response(
             {
                 "period": period,
+                "direction": direction,
                 "start": start.isoformat(),
                 "end": end.isoformat(),
                 "include_archived": include_archived,
