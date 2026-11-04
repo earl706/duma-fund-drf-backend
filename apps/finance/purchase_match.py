@@ -112,6 +112,9 @@ class MatchStats:
     avg_price: Decimal | None
     typical_price: Decimal | None
     typical_qty: Decimal | None
+    last_price: Decimal | None
+    prev_price: Decimal | None
+    first_price: Decimal | None
     usual_interval_days: float | None
     last_merchant: str
     last_purchased_at: date | None
@@ -121,6 +124,19 @@ class MatchStats:
     related: list[dict] = field(default_factory=list)
     match_kind: str = "exact"  # exact | fuzzy | related
     score: float = 0.0
+
+
+def event_to_dict(event: PurchaseEvent) -> dict:
+    return {
+        "title": event.title,
+        "cost": _decimal_str(event.cost),
+        "quantity": _decimal_str(event.quantity),
+        "unit": event.unit,
+        "merchant": event.merchant,
+        "date_effective": event.date_effective.isoformat(),
+        "transaction_id": event.transaction_id,
+        "item_id": event.item_id,
+    }
 
 
 def load_exclusions(profile) -> set[tuple[str, str]]:
@@ -289,19 +305,9 @@ def build_stats_for_events(
     else:
         status = "seen"
 
-    recent = [
-        {
-            "title": e.title,
-            "cost": _decimal_str(e.cost),
-            "quantity": _decimal_str(e.quantity),
-            "unit": e.unit,
-            "merchant": e.merchant,
-            "date_effective": e.date_effective.isoformat(),
-            "transaction_id": e.transaction_id,
-            "item_id": e.item_id,
-        }
-        for e in ordered[:3]
-    ]
+    recent = [event_to_dict(e) for e in ordered[:3]]
+    oldest = ordered[-1]
+    prev = ordered[1] if len(ordered) > 1 else None
 
     return MatchStats(
         display_title=display,
@@ -314,6 +320,9 @@ def build_stats_for_events(
         ),
         typical_price=typical_price,
         typical_qty=typical_qty,
+        last_price=last.cost,
+        prev_price=prev.cost if prev else None,
+        first_price=oldest.cost,
         usual_interval_days=interval,
         last_merchant=last.merchant,
         last_purchased_at=last.date_effective,
@@ -338,6 +347,9 @@ def stats_to_dict(stats: MatchStats) -> dict:
         "avg_price": _decimal_str(stats.avg_price),
         "typical_price": _decimal_str(stats.typical_price),
         "typical_qty": _decimal_str(stats.typical_qty),
+        "last_price": _decimal_str(stats.last_price),
+        "prev_price": _decimal_str(stats.prev_price),
+        "first_price": _decimal_str(stats.first_price),
         "usual_interval_days": stats.usual_interval_days,
         "last_merchant": stats.last_merchant,
         "last_purchased_at": (
@@ -348,6 +360,30 @@ def stats_to_dict(stats: MatchStats) -> dict:
         "recent": stats.recent,
         "related": stats.related,
     }
+
+
+def build_product_history(profile, title: str) -> dict | None:
+    """Full unit-price trail for one normalized title (chronological ascending)."""
+    norm = normalize_title(title)
+    if not norm:
+        return None
+
+    regular_marks = load_regular_marks(profile)
+    events = [e for e in iter_purchase_events(profile) if e.normalized_title == norm]
+    if not events:
+        return None
+
+    manually = events[0].family_key in regular_marks
+    stats = build_stats_for_events(events, manually_regular=manually)
+    if not stats:
+        return None
+
+    chronological = sorted(
+        events, key=lambda e: (e.date_effective, e.transaction_id or 0, e.item_id or 0)
+    )
+    payload = stats_to_dict(stats)
+    payload["purchases"] = [event_to_dict(e) for e in chronological]
+    return payload
 
 
 def group_events_by_normalized(
@@ -527,7 +563,22 @@ def build_insights(profile) -> dict:
         reverse=True,
     )
 
+    by_title: dict[str, dict] = {}
+    for row in regular + lapsed + recently_seen:
+        key = row.get("normalized_title") or ""
+        if key:
+            by_title[key] = row
+    all_items = sorted(
+        by_title.values(),
+        key=lambda r: (
+            r.get("last_purchased_at") or "",
+            r.get("display_title") or "",
+        ),
+        reverse=True,
+    )
+
     return {
+        "all": all_items,
         "regular": regular,
         "lapsed": lapsed,
         "due_soon": due_soon,

@@ -15,6 +15,7 @@ from .profile_views import (
 )
 from .purchases import (
     PurchaseExcludeView,
+    PurchaseHistoryView,
     PurchaseInsightsView,
     PurchaseLookupView,
     PurchaseMarkRegularView,
@@ -109,6 +110,11 @@ urlpatterns = [
         "finance/purchases/insights/",
         PurchaseInsightsView.as_view(),
         name="finance-purchase-insights",
+    ),
+    path(
+        "finance/purchases/history/",
+        PurchaseHistoryView.as_view(),
+        name="finance-purchase-history",
     ),
     path(
         "finance/purchases/notifications/",

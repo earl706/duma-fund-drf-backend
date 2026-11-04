@@ -12,6 +12,7 @@ from .models import (
 from .purchase_match import (
     build_insights,
     build_notifications,
+    build_product_history,
     exclusion_pair,
     family_key,
     lookup_purchases,
@@ -35,10 +36,30 @@ class PurchaseLookupView(ProfileScopedAPIView):
 
 
 class PurchaseInsightsView(ProfileScopedAPIView):
-    """GET — regular / lapsed / due-soon / recently seen aggregates."""
+    """GET — all / regular / lapsed / due-soon / recently seen aggregates."""
 
     def get(self, request):
         return Response(build_insights(self.get_profile()))
+
+
+class PurchaseHistoryView(ProfileScopedAPIView):
+    """GET ?title= — full unit-price purchase trail for one product title."""
+
+    def get(self, request):
+        title = (
+            request.query_params.get("title")
+            or request.query_params.get("normalized_title")
+            or ""
+        ).strip()
+        if not title:
+            raise ValidationError({"title": "Title is required."})
+        payload = build_product_history(self.get_profile(), title)
+        if not payload:
+            return Response(
+                {"detail": "No purchase history for that title."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(payload)
 
 
 class PurchaseNotificationsView(ProfileScopedAPIView):
