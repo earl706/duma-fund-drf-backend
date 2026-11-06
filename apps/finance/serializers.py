@@ -1,7 +1,9 @@
+from datetime import timedelta
 from decimal import Decimal
 
 from django.db.models import DecimalField, ExpressionWrapper, F, Sum, Value
 from django.db.models.functions import Coalesce
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 
@@ -223,19 +225,21 @@ class BalanceSourceSerializer(serializers.ModelSerializer):
 
     def validate_kind(self, value):
         if self.instance is None and value == SOURCE_KIND_CASH:
-            raise ValidationError("Cash is created automatically; pick bank or e-wallet.")
-        if self.instance is not None and self.instance.is_system and value != self.instance.kind:
+            raise ValidationError(
+                "Cash is created automatically; pick bank or e-wallet."
+            )
+        if (
+            self.instance is not None
+            and self.instance.is_system
+            and value != self.instance.kind
+        ):
             raise ValidationError("The Cash source kind cannot be changed.")
         if self.instance is None and value not in USER_SOURCE_KINDS:
             raise ValidationError("Kind must be bank or ewallet.")
         return value
 
     def validate_status(self, value):
-        if (
-            self.instance is not None
-            and self.instance.is_system
-            and value != "active"
-        ):
+        if self.instance is not None and self.instance.is_system and value != "active":
             raise ValidationError("Cash cannot be archived.")
         return value
 
@@ -243,7 +247,11 @@ class BalanceSourceSerializer(serializers.ModelSerializer):
         name = (value or "").strip()
         if not name:
             raise ValidationError("Name is required.")
-        if self.instance is not None and self.instance.is_system and name != self.instance.name:
+        if (
+            self.instance is not None
+            and self.instance.is_system
+            and name != self.instance.name
+        ):
             raise ValidationError("Cash cannot be renamed.")
         return name
 
@@ -251,7 +259,9 @@ class BalanceSourceSerializer(serializers.ModelSerializer):
         profile = _request_profile(self.context)
         name = attrs.get("name", getattr(self.instance, "name", None))
         if name and profile is not None:
-            qs = BalanceSource.objects.filter(profile=profile, name__iexact=name.strip())
+            qs = BalanceSource.objects.filter(
+                profile=profile, name__iexact=name.strip()
+            )
             if self.instance:
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
@@ -365,6 +375,53 @@ class DraftTransactionItemSerializer(serializers.Serializer):
 # -----------------------------------------------------------------------------
 # Transactions
 # -----------------------------------------------------------------------------
+def _midpoint_datetime(earlier, later):
+    """Return a timestamp strictly between earlier and later (or ±1ms if tied)."""
+    if later <= earlier:
+        return earlier + timedelta(milliseconds=1)
+    delta = later - earlier
+    half = timedelta(microseconds=max(delta.total_seconds() * 500_000, 1))
+    mid = earlier + half
+    if mid <= earlier:
+        mid = earlier + timedelta(microseconds=1)
+    if mid >= later:
+        mid = later - timedelta(microseconds=1)
+    if mid <= earlier:
+        return earlier + timedelta(milliseconds=1)
+    return mid
+
+
+def _created_at_for_insert(reference, position, profile):
+    """
+    Approximate list placement under Meta ordering -date_effective, -created_at.
+    above → newer created_at than reference; below → older.
+    """
+    same_day = Transaction.objects.filter(
+        profile=profile,
+        date_effective=reference.date_effective,
+    ).exclude(pk=reference.pk)
+    if position == "above":
+        newer = (
+            same_day.filter(created_at__gt=reference.created_at)
+            .order_by("created_at")
+            .first()
+        )
+        if newer is None:
+            candidate = timezone.now()
+            if candidate <= reference.created_at:
+                candidate = reference.created_at + timedelta(milliseconds=1)
+            return candidate
+        return _midpoint_datetime(reference.created_at, newer.created_at)
+    older = (
+        same_day.filter(created_at__lt=reference.created_at)
+        .order_by("-created_at")
+        .first()
+    )
+    if older is None:
+        return reference.created_at - timedelta(milliseconds=1)
+    return _midpoint_datetime(older.created_at, reference.created_at)
+
+
 class TransactionSerializer(serializers.ModelSerializer):
     receipt_image = serializers.ImageField(read_only=True)
     items_total = serializers.DecimalField(
@@ -376,6 +433,13 @@ class TransactionSerializer(serializers.ModelSerializer):
     )
     source = serializers.PrimaryKeyRelatedField(
         queryset=BalanceSource.objects.all(), required=False
+    )
+    # Create-only: place the new row above/below a same-day peer via created_at.
+    insert_relative_to = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True
+    )
+    insert_position = serializers.ChoiceField(
+        choices=["above", "below"], required=False, allow_null=True, write_only=True
     )
 
     class Meta:
@@ -400,6 +464,8 @@ class TransactionSerializer(serializers.ModelSerializer):
             "item_count",
             "created_at",
             "updated_at",
+            "insert_relative_to",
+            "insert_position",
         ]
         read_only_fields = [
             "id",
@@ -530,6 +596,43 @@ class TransactionSerializer(serializers.ModelSerializer):
         elif not self.instance and profile is not None:
             attrs["source"] = get_cash_source(profile)
 
+        rel_id = attrs.pop("insert_relative_to", serializers.empty)
+        position = attrs.pop("insert_position", serializers.empty)
+        if rel_id is serializers.empty:
+            rel_id = None
+        if position is serializers.empty:
+            position = None
+        if self.instance is not None:
+            if rel_id is not None or position is not None:
+                raise ValidationError(
+                    {
+                        "insert_relative_to": (
+                            "Insert placement is only allowed when creating."
+                        )
+                    }
+                )
+        elif (rel_id is None) != (position is None):
+            raise ValidationError(
+                {
+                    "insert_relative_to": (
+                        "Provide both insert_relative_to and insert_position, or neither."
+                    )
+                }
+            )
+        elif rel_id is not None:
+            if profile is None:
+                raise ValidationError(
+                    {"insert_relative_to": "Budget profile is required."}
+                )
+            try:
+                relative = Transaction.objects.get(pk=rel_id, profile=profile)
+            except Transaction.DoesNotExist as exc:
+                raise ValidationError(
+                    {"insert_relative_to": "Transaction not found in this profile."}
+                ) from exc
+            attrs["_insert_relative"] = relative
+            attrs["_insert_position"] = position
+
         return attrs
 
     def create(self, validated_data):
@@ -537,6 +640,8 @@ class TransactionSerializer(serializers.ModelSerializer):
         primary_only = validated_data.pop("_expense_primary_id", None)
         validated_data.pop("_clear_categories", None)
         validated_data.pop("categories", None)
+        relative = validated_data.pop("_insert_relative", None)
+        position = validated_data.pop("_insert_position", None)
         if expense_ids is None and primary_only is not None:
             expense_ids = [primary_only]
         elif expense_ids is None and validated_data.get("category") is not None:
@@ -546,9 +651,16 @@ class TransactionSerializer(serializers.ModelSerializer):
             apply_expense_categories(
                 txn, expense_ids, profile=_request_profile(self.context)
             )
+        if relative is not None and position is not None:
+            profile = _request_profile(self.context)
+            stamped = _created_at_for_insert(relative, position, profile)
+            Transaction.objects.filter(pk=txn.pk).update(created_at=stamped)
+            txn.refresh_from_db()
         return txn
 
     def update(self, instance, validated_data):
+        validated_data.pop("_insert_relative", None)
+        validated_data.pop("_insert_position", None)
         expense_ids = validated_data.pop("_expense_category_ids", None)
         primary_only = validated_data.pop("_expense_primary_id", None)
         clear_cats = validated_data.pop("_clear_categories", False)
