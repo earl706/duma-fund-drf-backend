@@ -335,7 +335,9 @@ def normalize_retail_payload(raw, categories, fallback_category_id):
         "document_kind": "retail_receipt",
         "merchant": merchant,
         "date_effective": date_effective,
-        "category_id": rolled_category_ids[0] if rolled_category_ids else header_category_id,
+        "category_id": (
+            rolled_category_ids[0] if rolled_category_ids else header_category_id
+        ),
         "category_ids": rolled_category_ids,
         "items": items,
     }
@@ -487,30 +489,6 @@ def _resolve_provider(override=None):
     return provider, api_key, model
 
 
-def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    b64 = base64.b64encode(file_bytes).decode("ascii")
-    data_url = f"data:{mime_type};base64,{b64}"
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ],
-            }
-        ],
-        response_format={"type": "json_object"},
-        temperature=0,
-    )
-    return _parse_model_json(response.choices[0].message.content)
-
-
 # Prefer current Flash IDs; keep older aliases as last resorts.
 GEMINI_MODEL_FALLBACKS = (
     "gemini-3.5-flash",
@@ -518,6 +496,17 @@ GEMINI_MODEL_FALLBACKS = (
     "gemini-3.6-flash",
     "gemini-2.5-flash",
 )
+# Provider cold-start / overload: first call often 503; short 0.8s was not enough.
+_PROVIDER_ATTEMPTS = 3
+_PROVIDER_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
+_OPENAI_TRANSIENT_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+def _sleep_backoff(attempt):
+    import time
+
+    delay = _PROVIDER_BACKOFF_SECONDS[min(attempt, len(_PROVIDER_BACKOFF_SECONDS) - 1)]
+    time.sleep(delay)
 
 
 def _gemini_model_candidates(preferred):
@@ -531,9 +520,91 @@ def _gemini_model_candidates(preferred):
     return ordered
 
 
-def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
-    import time
+def _gemini_response_text(response):
+    """
+    Prefer response.text; if empty (thought_signature / non-text parts),
+    concatenate candidate text parts so JSON parse still works.
+    """
+    text = (getattr(response, "text", None) or "").strip()
+    if text:
+        return text
 
+    chunks = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                chunks.append(str(part_text))
+    return "\n".join(chunks).strip()
+
+
+def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
+    from openai import (
+        APIConnectionError,
+        APIStatusError,
+        APITimeoutError,
+        OpenAI,
+        RateLimitError,
+    )
+
+    # max_retries=0: we own backoff so Gunicorn time budget stays predictable.
+    client = OpenAI(api_key=api_key, timeout=90.0, max_retries=0)
+    b64 = base64.b64encode(file_bytes).decode("ascii")
+    data_url = f"data:{mime_type};base64,{b64}"
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ],
+        }
+    ]
+
+    last_error = None
+    for attempt in range(_PROVIDER_ATTEMPTS):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0,
+            )
+            return _parse_model_json(response.choices[0].message.content)
+        except ValueError as exc:
+            # Empty / truncated JSON — often recovers on immediate retry.
+            last_error = exc
+            if attempt < _PROVIDER_ATTEMPTS - 1:
+                _sleep_backoff(attempt)
+                continue
+            raise
+        except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
+            last_error = exc
+            if attempt < _PROVIDER_ATTEMPTS - 1:
+                _sleep_backoff(attempt)
+                continue
+            raise RuntimeError(
+                "OpenAI is temporarily unavailable. Retry shortly."
+            ) from exc
+        except APIStatusError as exc:
+            last_error = exc
+            status = getattr(exc, "status_code", None)
+            if status in _OPENAI_TRANSIENT_STATUS and attempt < _PROVIDER_ATTEMPTS - 1:
+                _sleep_backoff(attempt)
+                continue
+            if status in _OPENAI_TRANSIENT_STATUS:
+                raise RuntimeError(
+                    f"OpenAI is temporarily unavailable (HTTP {status}). Retry shortly."
+                ) from exc
+            raise ValueError(f"OpenAI request failed: {exc}") from exc
+
+    raise RuntimeError(
+        f"OpenAI is temporarily unavailable: {last_error}"
+    ) from last_error
+
+
+def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
     from google import genai
     from google.genai import types
     from google.genai.errors import ClientError, ServerError
@@ -549,28 +620,46 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
     )
 
     last_server_error = None
+    last_parse_error = None
     last_missing = None
     for candidate in _gemini_model_candidates(model):
-        for attempt in range(2):
+        for attempt in range(_PROVIDER_ATTEMPTS):
             try:
                 response = client.models.generate_content(
                     model=candidate,
                     contents=contents,
                     config=config,
                 )
-                return _parse_model_json(response.text)
+                return _parse_model_json(_gemini_response_text(response))
             except ClientError as exc:
                 if exc.code == 404:
                     last_missing = candidate
                     break  # try next model
+                # 429 from Gemini surfaces as ClientError on some SDK versions.
+                if (
+                    getattr(exc, "code", None) == 429
+                    and attempt < _PROVIDER_ATTEMPTS - 1
+                ):
+                    last_server_error = (candidate, exc)
+                    _sleep_backoff(attempt)
+                    continue
                 raise ValueError(f"Gemini request failed: {exc}") from exc
             except ServerError as exc:
                 last_server_error = (candidate, exc)
-                if attempt == 0:
-                    time.sleep(0.8)
+                if attempt < _PROVIDER_ATTEMPTS - 1:
+                    _sleep_backoff(attempt)
                     continue
                 break  # try next model
+            except ValueError as exc:
+                # Parse / empty text — cold or thinking-model quirks; retry same model.
+                last_parse_error = exc
+                if attempt < _PROVIDER_ATTEMPTS - 1:
+                    _sleep_backoff(attempt)
+                    continue
+                break
 
+    if last_parse_error and not last_server_error:
+        raise last_parse_error
     if last_missing and not last_server_error:
         raise ValueError(
             f"Gemini model '{model}' is not available. "
@@ -594,9 +683,7 @@ def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=N
         )
     )
     income_categories = list(
-        Category.objects.filter(profile=profile, kind="income").select_related(
-            "parent"
-        )
+        Category.objects.filter(profile=profile, kind="income").select_related("parent")
     )
     expense_fallback = get_default_expense_category(profile)
     income_fallback = get_default_income_category(profile)
