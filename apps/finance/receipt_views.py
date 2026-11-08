@@ -293,6 +293,7 @@ class CommitReceiptMixin:
         with db_transaction.atomic():
             txn = Transaction.objects.create(
                 owner=owner,
+                updated_by=owner,
                 profile=profile,
                 type="expense",
                 amount=Decimal("0.00"),
@@ -360,6 +361,7 @@ class CommitReceiptMixin:
                 )
                 txn = Transaction.objects.create(
                     owner=owner,
+                    updated_by=owner,
                     profile=profile,
                     type=txn_type,
                     amount=entry["amount"],

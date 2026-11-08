@@ -422,12 +422,32 @@ def _created_at_for_insert(reference, position, profile):
     return _midpoint_datetime(older.created_at, reference.created_at)
 
 
+def _author_payload(user):
+    if user is None:
+        return None
+    return {
+        "id": user.id,
+        "email": user.email,
+        "full_name": user.full_name or "",
+    }
+
+
+def transaction_author(instance):
+    """Last editor if set, else creator (owner), else profile owner."""
+    user = getattr(instance, "updated_by", None) or getattr(instance, "owner", None)
+    if user is None:
+        profile = getattr(instance, "profile", None)
+        user = getattr(profile, "owner", None) if profile is not None else None
+    return _author_payload(user)
+
+
 class TransactionSerializer(serializers.ModelSerializer):
     receipt_image = serializers.ImageField(read_only=True)
     items_total = serializers.DecimalField(
         max_digits=14, decimal_places=2, read_only=True, required=False, allow_null=True
     )
     item_count = serializers.IntegerField(read_only=True, required=False)
+    author = serializers.SerializerMethodField()
     categories = serializers.PrimaryKeyRelatedField(
         many=True, queryset=Category.objects.all(), required=False
     )
@@ -462,6 +482,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "date_last_modified",
             "items_total",
             "item_count",
+            "author",
             "created_at",
             "updated_at",
             "insert_relative_to",
@@ -474,9 +495,13 @@ class TransactionSerializer(serializers.ModelSerializer):
             "receipt_image",
             "items_total",
             "item_count",
+            "author",
             "created_at",
             "updated_at",
         ]
+
+    def get_author(self, instance):
+        return transaction_author(instance)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

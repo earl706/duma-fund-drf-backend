@@ -303,6 +303,14 @@ class Transaction(OwnedModel):
     date_created = models.DateField(default=today)
     date_effective = models.DateField(default=today)
     date_last_modified = models.DateField(auto_now=True)
+    # Last user who edited this header (or its line items). Null → fall back to owner.
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="updated_transactions",
+    )
 
     class Meta(OwnedModel.Meta):
         ordering = ["-date_effective", "-created_at"]

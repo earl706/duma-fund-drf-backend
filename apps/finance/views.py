@@ -298,7 +298,14 @@ class TransactionViewSet(ProfileScopedViewSet):
         qs = (
             annotate_transaction_amount(super().get_queryset())
             .annotate(item_count=Count("items", distinct=True))
-            .select_related("category", "source")
+            .select_related(
+                "category",
+                "source",
+                "owner",
+                "updated_by",
+                "profile",
+                "profile__owner",
+            )
             .prefetch_related("categories")
         )
         category = self.request.query_params.get("category")
@@ -310,14 +317,19 @@ class TransactionViewSet(ProfileScopedViewSet):
 
     def perform_create(self, serializer):
         txn_type = serializer.validated_data.get("type")
-        extras = {"owner": self.request.user, "profile": self.get_profile()}
+        user = self.request.user
+        extras = {
+            "owner": user,
+            "updated_by": user,
+            "profile": self.get_profile(),
+        }
         if txn_type in ("transfer_in", "transfer_out"):
             serializer.save(category=None, **extras)
         else:
             serializer.save(**extras)
 
     def perform_update(self, serializer):
-        instance = serializer.save()
+        instance = serializer.save(updated_by=self.request.user)
         sync_expense_amount(instance)
 
 
@@ -356,6 +368,10 @@ class TransactionItemViewSet(ProfileScopedViewSet):
         except Transaction.DoesNotExist as exc:
             raise NotFound() from exc
 
+    def _touch_transaction_editor(self, txn):
+        txn.updated_by = self.request.user
+        txn.save(update_fields=["updated_by", "updated_at"])
+
     def perform_create(self, serializer):
         txn = self._scoped_transaction()
         if txn.type != "expense":
@@ -363,14 +379,17 @@ class TransactionItemViewSet(ProfileScopedViewSet):
                 {"detail": "Line items are only allowed on expense transactions."}
             )
         item = serializer.save(owner=self.request.user, transaction=txn)
+        self._touch_transaction_editor(txn)
         sync_expense_amount(txn)
         return item
 
     def perform_update(self, serializer):
         item = serializer.save()
+        self._touch_transaction_editor(item.transaction)
         sync_expense_amount(item.transaction)
 
     def perform_destroy(self, instance):
         txn = instance.transaction
         super().perform_destroy(instance)
+        self._touch_transaction_editor(txn)
         sync_expense_amount(txn)
