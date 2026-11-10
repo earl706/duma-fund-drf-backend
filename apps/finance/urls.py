@@ -30,6 +30,7 @@ from .receipt_views import (
 from .views import (
     BalanceSourceViewSet,
     CategoryViewSet,
+    InternalTransferCreateView,
     PaymentContactViewSet,
     TransactionItemViewSet,
     TransactionViewSet,
@@ -90,6 +91,11 @@ urlpatterns = [
         "finance/balance/",
         BalanceView.as_view(),
         name="finance-balance",
+    ),
+    path(
+        "finance/transfers/",
+        InternalTransferCreateView.as_view(),
+        name="finance-internal-transfer",
     ),
     path(
         "finance/analytics/",

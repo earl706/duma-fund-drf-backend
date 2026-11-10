@@ -1,5 +1,5 @@
 from django.db import transaction as db_transaction
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
@@ -16,6 +16,7 @@ from .models import (
 from .scope import (
     LEDGER_WRITE_ROLES,
     OWNER_ONLY_ROLES,
+    ProfileScopedAPIView,
     ProfileScopedViewSet,
     require_role,
     resolve_profile,
@@ -24,6 +25,7 @@ from .serializers import (
     BalanceSourceSerializer,
     CategoryReassignDeleteSerializer,
     CategorySerializer,
+    InternalTransferSerializer,
     PaymentContactSerializer,
     SourceReassignDeleteSerializer,
     TransactionItemSerializer,
@@ -223,6 +225,13 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
 
         with db_transaction.atomic():
             Transaction.objects.filter(source=source).update(source=target)
+            # Internal moves that credited this source: retarget destination.
+            Transaction.objects.filter(to_source=source).update(to_source=target)
+            # Collapse invalid same-source internal rows to unpaired transfer_out.
+            Transaction.objects.filter(source=F("to_source"), to_source__isnull=False).update(
+                to_source=None,
+                fee=0,
+            )
             source.delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -232,7 +241,7 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
         source = self.get_object()
         if source.is_system or source.kind == "cash":
             raise ValidationError({"detail": "Cash cannot be deleted."})
-        if source.transactions.exists():
+        if source.transactions.exists() or source.incoming_transfers.exists():
             raise ValidationError(
                 {
                     "detail": (
@@ -260,6 +269,57 @@ class PaymentContactViewSet(ProfileScopedViewSet):
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user, profile=self.get_profile())
+
+
+# -----------------------------------------------------------------------------
+# Internal wallet transfers (single Transaction)
+# -----------------------------------------------------------------------------
+class InternalTransferCreateView(ProfileScopedAPIView):
+    """POST /api/finance/transfers/ — one transfer_out with to_source + fee."""
+
+    write_roles = LEDGER_WRITE_ROLES
+
+    def post(self, request):
+        self.assert_write()
+        ser = InternalTransferSerializer(data=request.data, context={"request": request})
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        profile = self.get_profile()
+        user = request.user
+        from_src = data["from_source_obj"]
+        to_src = data["to_source_obj"]
+        txn = Transaction.objects.create(
+            owner=user,
+            updated_by=user,
+            profile=profile,
+            source=from_src,
+            to_source=to_src,
+            type="transfer_out",
+            amount=data["amount"],
+            fee=data["fee"],
+            title=(data.get("title") or "").strip(),
+            note=data.get("note") or "",
+            category=None,
+            date_effective=data["date_effective"],
+            status="active",
+        )
+        out = annotate_transaction_amount(
+            Transaction.objects.filter(pk=txn.pk)
+            .select_related(
+                "category",
+                "source",
+                "to_source",
+                "owner",
+                "updated_by",
+                "profile",
+                "profile__owner",
+            )
+            .annotate(item_count=Count("items", distinct=True))
+        ).first()
+        return Response(
+            TransactionSerializer(out, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -301,6 +361,7 @@ class TransactionViewSet(ProfileScopedViewSet):
             .select_related(
                 "category",
                 "source",
+                "to_source",
                 "owner",
                 "updated_by",
                 "profile",

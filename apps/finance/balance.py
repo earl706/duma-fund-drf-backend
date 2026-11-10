@@ -21,14 +21,55 @@ def _zero_totals():
     return {key: Decimal("0.00") for key in TYPE_KEYS}
 
 
-def _typed_sums(qs):
-    totals = _zero_totals()
-    for row in qs.values("type").annotate(
+def _add_total(bucket, key, amount):
+    if amount is None:
+        return
+    bucket[key] = (bucket.get(key) or Decimal("0.00")) + (amount or Decimal("0.00"))
+
+
+def _accumulate_effects(qs, by_source):
+    """
+    Apply ledger rows into per-source type buckets.
+    Unpaired rows: debit/credit `source` by type as today.
+    Internal transfer_out (to_source set): from gets transfer_out += amount+fee;
+    destination gets transfer_in += amount.
+    """
+    unpaired = qs.filter(to_source__isnull=True)
+    for row in unpaired.values("source_id", "type").annotate(
         total=Coalesce(Sum("amount"), Value(Decimal("0.00")))
     ):
-        if row["type"] in totals:
-            totals[row["type"]] = row["total"] or Decimal("0.00")
+        sid = row["source_id"]
+        bucket = by_source.setdefault(sid, _zero_totals())
+        if row["type"] in bucket:
+            _add_total(bucket, row["type"], row["total"])
+
+    internal = qs.filter(to_source__isnull=False, type="transfer_out")
+    for row in internal.values("source_id", "to_source_id").annotate(
+        principal=Coalesce(Sum("amount"), Value(Decimal("0.00"))),
+        fees=Coalesce(Sum("fee"), Value(Decimal("0.00"))),
+    ):
+        principal = row["principal"] or Decimal("0.00")
+        fees = row["fees"] or Decimal("0.00")
+        from_bucket = by_source.setdefault(row["source_id"], _zero_totals())
+        to_bucket = by_source.setdefault(row["to_source_id"], _zero_totals())
+        _add_total(from_bucket, "transfer_out", principal + fees)
+        _add_total(to_bucket, "transfer_in", principal)
+
+
+def _typed_sums_from_effects(qs):
+    """Profile-level type totals after dual-applying internal moves."""
+    by_source = {}
+    _accumulate_effects(qs, by_source)
+    totals = _zero_totals()
+    for bucket in by_source.values():
+        for key in TYPE_KEYS:
+            totals[key] += bucket[key]
     return totals
+
+
+def _typed_sums(qs):
+    """Backward-compatible name: includes internal dual-apply."""
+    return _typed_sums_from_effects(qs)
 
 
 def _net_from_totals(starting, totals):
@@ -73,18 +114,20 @@ def compute_balance(profile, as_of=None):
         date_effective__lte=as_of,
     )
     by_source = {}
-    for row in txn_qs.values("source_id", "type").annotate(
-        total=Coalesce(Sum("amount"), Value(Decimal("0.00")))
-    ):
-        sid = row["source_id"]
-        bucket = by_source.setdefault(sid, _zero_totals())
-        if row["type"] in bucket:
-            bucket[row["type"]] = row["total"] or Decimal("0.00")
+    _accumulate_effects(txn_qs, by_source)
 
-    txn_counts = {
-        row["source_id"]: row["c"]
-        for row in txn_qs.values("source_id").annotate(c=Count("id"))
-    }
+    txn_counts = {}
+    for row in txn_qs.values("source_id").annotate(c=Count("id")):
+        txn_counts[row["source_id"]] = txn_counts.get(row["source_id"], 0) + int(
+            row["c"]
+        )
+    for row in (
+        txn_qs.filter(to_source__isnull=False)
+        .values("to_source_id")
+        .annotate(c=Count("id"))
+    ):
+        sid = row["to_source_id"]
+        txn_counts[sid] = txn_counts.get(sid, 0) + int(row["c"])
 
     source_rows = []
     profile_totals = _zero_totals()

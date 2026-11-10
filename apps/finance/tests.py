@@ -313,6 +313,33 @@ class FinanceAnalyticsWindowTests(APITestCase):
         self.assertEqual(point["money_out"], "35.00")
         self.assertEqual(point["txn_spend"], "30.00")
 
+    def test_analytics_internal_transfer_fee_only_out(self):
+        gcash = BalanceSource.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            name="GCash",
+            kind="ewallet",
+            starting_balance=Decimal("0.00"),
+        )
+        cash = get_cash_source(self.profile)
+        self._txn(
+            type="transfer_out",
+            amount=Decimal("100.00"),
+            fee=Decimal("15.00"),
+            source=cash,
+            to_source=gcash,
+            title="Cash → GCash",
+        )
+        day = self.today.isoformat()
+        res = self.client.get(
+            f"/api/finance/analytics/?grain=day&start={day}&end={day}",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 200)
+        point = res.data["points"][0]
+        self.assertEqual(point["money_in"], "0.00")
+        self.assertEqual(point["money_out"], "15.00")
+
     def test_breakdown_pie_folds_named_other_into_one_slice(self):
         cats = {
             row.name: row
@@ -917,3 +944,87 @@ class TransactionInsertAdjacentTests(APITestCase):
     def test_insert_fields_must_be_paired(self):
         res = self._blank(insert_relative_to=self.anchor.id)
         self.assertEqual(res.status_code, 400)
+
+
+class InternalTransferTests(APITestCase):
+    def setUp(self):
+        self.user = make_user("mover@example.com", "Mover")
+        self.profile = BudgetProfile.objects.get(owner=self.user)
+        self.client.force_authenticate(self.user)
+        self.headers = {"HTTP_X_BUDGET_PROFILE_ID": str(self.profile.id)}
+        self.cash = get_cash_source(self.profile)
+        self.cash.starting_balance = Decimal("500.00")
+        self.cash.save(update_fields=["starting_balance"])
+        self.gcash = BalanceSource.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            name="GCash",
+            kind="ewallet",
+            starting_balance=Decimal("50.00"),
+        )
+
+    def test_create_one_row_and_dual_balances(self):
+        res = self.client.post(
+            "/api/finance/transfers/",
+            {
+                "from_source": self.cash.id,
+                "to_source": self.gcash.id,
+                "amount": "100.00",
+                "fee": "10.00",
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 201, res.data)
+        self.assertEqual(res.data["type"], "transfer_out")
+        self.assertEqual(res.data["source"], self.cash.id)
+        self.assertEqual(res.data["to_source"], self.gcash.id)
+        self.assertEqual(res.data["amount"], "100.00")
+        self.assertEqual(res.data["fee"], "10.00")
+        self.assertEqual(Transaction.objects.filter(profile=self.profile).count(), 1)
+
+        bal = self.client.get("/api/finance/balance/", **self.headers)
+        self.assertEqual(bal.status_code, 200)
+        by_id = {row["id"]: row for row in bal.data["sources"]}
+        # Cash: 500 - 100 - 10 = 390; GCash: 50 + 100 = 150; profile: 550 - 10 = 540
+        self.assertEqual(by_id[self.cash.id]["balance"], "390.00")
+        self.assertEqual(by_id[self.gcash.id]["balance"], "150.00")
+        self.assertEqual(bal.data["balance"], "540.00")
+
+    def test_reject_same_source(self):
+        res = self.client.post(
+            "/api/finance/transfers/",
+            {
+                "from_source": self.cash.id,
+                "to_source": self.cash.id,
+                "amount": "10.00",
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_delete_reverses_balances(self):
+        created = self.client.post(
+            "/api/finance/transfers/",
+            {
+                "from_source": self.cash.id,
+                "to_source": self.gcash.id,
+                "amount": "40.00",
+                "fee": "5.00",
+            },
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(created.status_code, 201)
+        txn_id = created.data["id"]
+        deleted = self.client.delete(
+            f"/api/finance/transactions/{txn_id}/",
+            **self.headers,
+        )
+        self.assertEqual(deleted.status_code, 204)
+        bal = self.client.get("/api/finance/balance/", **self.headers)
+        by_id = {row["id"]: row for row in bal.data["sources"]}
+        self.assertEqual(by_id[self.cash.id]["balance"], "500.00")
+        self.assertEqual(by_id[self.gcash.id]["balance"], "50.00")
+        self.assertEqual(bal.data["balance"], "550.00")

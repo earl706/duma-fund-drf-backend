@@ -454,6 +454,11 @@ class TransactionSerializer(serializers.ModelSerializer):
     source = serializers.PrimaryKeyRelatedField(
         queryset=BalanceSource.objects.all(), required=False
     )
+    to_source = serializers.PrimaryKeyRelatedField(
+        queryset=BalanceSource.objects.all(),
+        required=False,
+        allow_null=True,
+    )
     # Create-only: place the new row above/below a same-day peer via created_at.
     insert_relative_to = serializers.IntegerField(
         required=False, allow_null=True, write_only=True
@@ -469,10 +474,12 @@ class TransactionSerializer(serializers.ModelSerializer):
             "uuid",
             "type",
             "amount",
+            "fee",
             "title",
             "merchant",
             "note",
             "source",
+            "to_source",
             "category",
             "categories",
             "receipt_image",
@@ -516,6 +523,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             if profile is not None:
                 source_qs = source_qs.filter(profile=profile)
             self.fields["source"].queryset = source_qs
+            self.fields["to_source"].queryset = source_qs
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -611,6 +619,14 @@ class TransactionSerializer(serializers.ModelSerializer):
         if amount is not None and amount < 0:
             raise ValidationError({"amount": "Amount must be zero or positive."})
 
+        fee = attrs.get("fee", serializers.empty)
+        if fee is serializers.empty:
+            fee = getattr(self.instance, "fee", Decimal("0.00"))
+        if fee is None:
+            fee = Decimal("0.00")
+        if fee < 0:
+            raise ValidationError({"fee": "Fee must be zero or positive."})
+
         source = attrs.get("source", serializers.empty)
         if source is not serializers.empty:
             if profile is None or source.profile_id != profile.id:
@@ -620,6 +636,36 @@ class TransactionSerializer(serializers.ModelSerializer):
                 raise ValidationError({"source": "That source is archived."})
         elif not self.instance and profile is not None:
             attrs["source"] = get_cash_source(profile)
+            source = attrs["source"]
+        else:
+            source = getattr(self.instance, "source", None)
+
+        to_source = attrs.get("to_source", serializers.empty)
+        if to_source is serializers.empty:
+            to_source = getattr(self.instance, "to_source", None)
+        if to_source is not None:
+            if txn_type != "transfer_out":
+                raise ValidationError(
+                    {"to_source": "Destination is only valid on transfer_out."}
+                )
+            if profile is None or to_source.profile_id != profile.id:
+                raise ValidationError({"to_source": "Invalid balance source."})
+            keeping_to = (
+                self.instance is not None and self.instance.to_source_id == to_source.id
+            )
+            if to_source.status != "active" and not keeping_to:
+                raise ValidationError({"to_source": "That source is archived."})
+            if source is not None and to_source.id == source.id:
+                raise ValidationError(
+                    {"to_source": "Choose a different destination source."}
+                )
+            attrs["fee"] = fee
+        else:
+            # Unpaired / non-internal: fee is not used.
+            if "fee" in attrs or (self.instance is None):
+                attrs["fee"] = Decimal("0.00")
+            if txn_type in ("income", "expense", "transfer_in") and "to_source" in attrs:
+                attrs["to_source"] = None
 
         rel_id = attrs.pop("insert_relative_to", serializers.empty)
         position = attrs.pop("insert_position", serializers.empty)
@@ -809,6 +855,61 @@ class BulkCommitReceiptSerializer(serializers.Serializer):
                 f"At most {MAX_BULK_RECEIPT_COMMITS} receipts per batch."
             )
         return value
+
+
+# -----------------------------------------------------------------------------
+# Internal wallet transfers (single Transaction row)
+# -----------------------------------------------------------------------------
+class InternalTransferSerializer(serializers.Serializer):
+    from_source = serializers.IntegerField()
+    to_source = serializers.IntegerField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    fee = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        min_value=Decimal("0"),
+        required=False,
+        default=Decimal("0.00"),
+    )
+    date_effective = serializers.DateField(required=False)
+    title = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate(self, attrs):
+        profile = _request_profile(self.context)
+        if profile is None:
+            raise ValidationError({"detail": "Active profile is required."})
+        from_id = attrs["from_source"]
+        to_id = attrs["to_source"]
+        if from_id == to_id:
+            raise ValidationError(
+                {"to_source": "Choose a different destination source."}
+            )
+        sources = {
+            s.id: s
+            for s in BalanceSource.objects.filter(
+                profile=profile, pk__in=[from_id, to_id]
+            )
+        }
+        from_src = sources.get(from_id)
+        to_src = sources.get(to_id)
+        if from_src is None:
+            raise ValidationError({"from_source": "Invalid balance source."})
+        if to_src is None:
+            raise ValidationError({"to_source": "Invalid balance source."})
+        if from_src.status != "active":
+            raise ValidationError({"from_source": "That source is archived."})
+        if to_src.status != "active":
+            raise ValidationError({"to_source": "That source is archived."})
+        attrs["from_source_obj"] = from_src
+        attrs["to_source_obj"] = to_src
+        if not attrs.get("date_effective"):
+            attrs["date_effective"] = timezone.localdate()
+        fee = attrs.get("fee") or Decimal("0.00")
+        attrs["fee"] = fee
+        if not (attrs.get("title") or "").strip():
+            attrs["title"] = f"{from_src.name} → {to_src.name}"
+        return attrs
 
 
 # -----------------------------------------------------------------------------

@@ -272,8 +272,24 @@ class Transaction(OwnedModel):
         on_delete=models.PROTECT,
         related_name="transactions",
     )
+    # Internal wallet move: credit this source by `amount` while `source` is debited
+    # amount + fee. Null for income/expense and unpaired external transfers.
+    to_source = models.ForeignKey(
+        BalanceSource,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="incoming_transfers",
+    )
     type = models.CharField(max_length=20, choices=TRANSACTION_TYPE_CHOICES)
     amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    # Fee charged on `source` for internal moves (to_source set). Ignored otherwise.
+    fee = models.DecimalField(
         max_digits=14,
         decimal_places=2,
         default=Decimal("0.00"),
@@ -317,6 +333,11 @@ class Transaction(OwnedModel):
 
     def __str__(self):
         return f"{self.type} {self.amount} ({self.title or self.pk})"
+
+    @property
+    def is_internal_transfer(self):
+        """Single-row wallet move: from `source` to `to_source`."""
+        return self.type == "transfer_out" and self.to_source_id is not None
 
 
 # -----------------------------------------------------------------------------

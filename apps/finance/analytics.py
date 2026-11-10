@@ -211,8 +211,10 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
             if key is not None:
                 item_map[key] = row["item_spend"]
 
+        # Unpaired rows only — internal moves (to_source set) are fee-only for cash-flow.
+        unpaired = txns.filter(to_source__isnull=True)
         type_rows = (
-            txns.annotate(period=trunc("date_effective"))
+            unpaired.annotate(period=trunc("date_effective"))
             .values("period", "type")
             .annotate(
                 txn_count=Count("id"),
@@ -235,12 +237,31 @@ class FinanceAnalyticsView(ProfileScopedAPIView):
             if txn_type == "expense":
                 expense_counts[key] = row["txn_count"]
 
+        fee_map = {}
+        fee_rows = (
+            txns.filter(to_source__isnull=False, type="transfer_out")
+            .annotate(period=trunc("date_effective"))
+            .values("period")
+            .annotate(
+                fees=Coalesce(
+                    Sum("fee"),
+                    Value(Decimal("0.00")),
+                    output_field=DecimalField(max_digits=14, decimal_places=2),
+                )
+            )
+        )
+        for row in fee_rows:
+            key = _period_start(_as_date(row["period"]), grain)
+            if key is not None:
+                fee_map[key] = row["fees"] or Decimal("0.00")
+
         points = []
         for period in _iter_periods(start, end, grain):
             typed = typed_map.get(period) or _empty_type_totals()
             expense = typed["expense"]
             money_in = sum((typed[key] for key in INFLOW_TYPES), Decimal("0.00"))
             money_out = sum((typed[key] for key in OUTFLOW_TYPES), Decimal("0.00"))
+            money_out += fee_map.get(period, Decimal("0.00"))
             spend = item_map.get(period, Decimal("0.00"))
             txn_count = expense_counts.get(period, 0)
             points.append(
@@ -390,7 +411,8 @@ class FinanceBreakdownView(ProfileScopedAPIView):
             "transfer_in": Decimal("0.00"),
             "transfer_out": Decimal("0.00"),
         }
-        for row in type_qs.values("type").annotate(
+        # Unpaired only; internal principal excluded from transfer totals.
+        for row in type_qs.filter(to_source__isnull=True).values("type").annotate(
             total=Coalesce(
                 Sum("amount"),
                 Value(Decimal("0.00")),
@@ -399,6 +421,15 @@ class FinanceBreakdownView(ProfileScopedAPIView):
         ):
             if row["type"] in typed:
                 typed[row["type"]] = row["total"] or Decimal("0.00")
+        # Internal fees count as transfer_out for breakdown totals.
+        fee_total = type_qs.filter(to_source__isnull=False, type="transfer_out").aggregate(
+            fees=Coalesce(
+                Sum("fee"),
+                Value(Decimal("0.00")),
+                output_field=DecimalField(max_digits=14, decimal_places=2),
+            )
+        )["fees"] or Decimal("0.00")
+        typed["transfer_out"] += fee_total
         spent = typed["expense"]
 
         bal = compute_balance(profile)
