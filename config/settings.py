@@ -287,6 +287,8 @@ OPENAI_API_KEY = env("OPENAI_API_KEY", "")
 OPENAI_RECEIPT_MODEL = env("OPENAI_RECEIPT_MODEL", "gpt-4o-mini")
 GEMINI_API_KEY = env("GEMINI_API_KEY", "")
 GEMINI_RECEIPT_MODEL = env("GEMINI_RECEIPT_MODEL", "gemini-3.5-flash")
+# Optional Fernet key (url-safe base64 of 32 bytes). Empty → derive from SECRET_KEY.
+LLM_CREDENTIALS_KEY = env("LLM_CREDENTIALS_KEY", "")
 
 # -----------------------------------------------------------------------------
 # django-allauth (email verification for API registration)

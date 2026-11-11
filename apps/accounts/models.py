@@ -79,3 +79,37 @@ class UserSecurity(models.Model):
 def get_user_security(user) -> "UserSecurity":
     security, _ = UserSecurity.objects.get_or_create(user=user)
     return security
+
+
+# -----------------------------------------------------------------------------
+# Receipt AI (per-user LLM credentials)
+# -----------------------------------------------------------------------------
+
+
+class UserLlmSettings(models.Model):
+
+    PROVIDER_OPENAI = "openai"
+    PROVIDER_GEMINI = "gemini"
+    PROVIDER_CHOICES = (
+        (PROVIDER_OPENAI, "OpenAI"),
+        (PROVIDER_GEMINI, "Gemini"),
+    )
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="llm")
+    provider = models.CharField(
+        max_length=16, choices=PROVIDER_CHOICES, default=PROVIDER_OPENAI
+    )
+    openai_api_key_encrypted = models.TextField(blank=True)
+    openai_api_key_last4 = models.CharField(max_length=4, blank=True)
+    openai_model = models.CharField(max_length=64, default="gpt-4o-mini")
+    gemini_api_key_encrypted = models.TextField(blank=True)
+    gemini_api_key_last4 = models.CharField(max_length=4, blank=True)
+    gemini_model = models.CharField(max_length=64, default="gemini-3.5-flash")
+
+    def __str__(self):
+        return f"LLM<{self.user.email}>"
+
+
+def get_user_llm_settings(user) -> "UserLlmSettings":
+    settings_row, _ = UserLlmSettings.objects.get_or_create(user=user)
+    return settings_row

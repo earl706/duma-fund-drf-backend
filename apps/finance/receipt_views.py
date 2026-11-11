@@ -91,9 +91,33 @@ def parse_commit_payload(data):
 
 
 def llm_override_from_request(request):
+    """Optional per-request override (legacy client-sent key; prefer account settings)."""
     provider = (request.data.get("llm_provider") or "").strip().lower()
     api_key = (request.data.get("llm_api_key") or "").strip()
     model = (request.data.get("llm_model") or "").strip()
+    if not (provider or api_key or model):
+        return None
+    return {
+        "provider": provider or None,
+        "api_key": api_key or None,
+        "model": model or None,
+    }
+
+
+def resolve_llm_override(request):
+    """
+    Merge order: request override api_key/provider/model, then encrypted
+    UserLlmSettings, then (inside receipt_scan) server env.
+    """
+    from apps.accounts.llm_views import active_llm_override_for_user
+
+    stored = active_llm_override_for_user(request.user) or {}
+    req = llm_override_from_request(request) or {}
+    if not stored and not req:
+        return None
+    provider = req.get("provider") or stored.get("provider")
+    api_key = req.get("api_key") or stored.get("api_key")
+    model = req.get("model") or stored.get("model")
     if not (provider or api_key or model):
         return None
     return {
@@ -136,7 +160,7 @@ class ReceiptScanView(ProfileScopedAPIView):
 
         file_bytes = upload.read()
         mime_type = upload.content_type or "image/jpeg"
-        llm_override = llm_override_from_request(request)
+        llm_override = resolve_llm_override(request)
 
         try:
             draft = scan_receipt_image(
@@ -191,7 +215,7 @@ class BulkScanReceiptView(ProfileScopedAPIView):
             )
 
         images = collect_bulk_images(request, count)
-        llm_override = llm_override_from_request(request)
+        llm_override = resolve_llm_override(request)
         results = []
         ok_count = 0
         for index, (file_bytes, mime_type, _name) in enumerate(images):

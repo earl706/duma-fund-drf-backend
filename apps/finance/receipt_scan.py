@@ -489,12 +489,12 @@ def _resolve_provider(override=None):
     return provider, api_key, model
 
 
-# Prefer current Flash IDs; keep older aliases as last resorts.
+# Prefer stable Flash IDs for structured JSON; 3.6 can emit thought-only stubs.
 GEMINI_MODEL_FALLBACKS = (
     "gemini-3.5-flash",
+    "gemini-2.5-flash",
     "gemini-3.8-flash",
     "gemini-3.6-flash",
-    "gemini-2.5-flash",
 )
 # Provider cold-start / overload: first call often 503; short 0.8s was not enough.
 _PROVIDER_ATTEMPTS = 3
@@ -523,7 +523,7 @@ def _gemini_model_candidates(preferred):
 def _gemini_response_text(response):
     """
     Prefer response.text; if empty (thought_signature / non-text parts),
-    concatenate candidate text parts so JSON parse still works.
+    concatenate non-thought text parts so JSON parse still works.
     """
     text = (getattr(response, "text", None) or "").strip()
     if text:
@@ -533,13 +533,15 @@ def _gemini_response_text(response):
     for candidate in getattr(response, "candidates", None) or []:
         content = getattr(candidate, "content", None)
         for part in getattr(content, "parts", None) or []:
+            if getattr(part, "thought", None) is True:
+                continue
             part_text = getattr(part, "text", None)
             if part_text:
                 chunks.append(str(part_text))
     return "\n".join(chunks).strip()
 
 
-def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
+def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
     from openai import (
         APIConnectionError,
         APIStatusError,
@@ -571,7 +573,8 @@ def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
                 response_format={"type": "json_object"},
                 temperature=0,
             )
-            return _parse_model_json(response.choices[0].message.content)
+            parsed = _parse_model_json(response.choices[0].message.content)
+            return normalize(parsed) if normalize else parsed
         except ValueError as exc:
             # Empty / truncated JSON — often recovers on immediate retry.
             last_error = exc
@@ -604,7 +607,7 @@ def _scan_openai(file_bytes, mime_type, prompt, api_key, model):
     ) from last_error
 
 
-def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
+def _scan_gemini(file_bytes, mime_type, prompt, api_key, model, normalize=None):
     from google import genai
     from google.genai import types
     from google.genai.errors import ClientError, ServerError
@@ -614,9 +617,12 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
         types.Part.from_text(text=prompt),
         types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
     ]
+    # Disable AFC + thinking so Flash returns plain JSON (not thought_signature stubs).
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         temperature=0,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
     last_server_error = None
@@ -630,7 +636,8 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
                     contents=contents,
                     config=config,
                 )
-                return _parse_model_json(_gemini_response_text(response))
+                parsed = _parse_model_json(_gemini_response_text(response))
+                return normalize(parsed) if normalize else parsed
             except ClientError as exc:
                 if exc.code == 404:
                     last_missing = candidate
@@ -651,7 +658,7 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model):
                     continue
                 break  # try next model
             except ValueError as exc:
-                # Parse / empty text — cold or thinking-model quirks; retry same model.
+                # Parse / empty extract — cold or thinking-model quirks; retry / next model.
                 last_parse_error = exc
                 if attempt < _PROVIDER_ATTEMPTS - 1:
                     _sleep_backoff(attempt)
@@ -700,16 +707,20 @@ def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=N
     )
     provider, api_key, model = _resolve_provider(llm_override)
 
-    if provider == "gemini":
-        parsed = _scan_gemini(file_bytes, mime_type, prompt, api_key, model)
-    else:
-        parsed = _scan_openai(file_bytes, mime_type, prompt, api_key, model)
+    def normalize(parsed):
+        return normalize_receipt_payload(
+            parsed,
+            expense_categories,
+            expense_fallback_id,
+            income_categories,
+            income_fallback_id,
+            account_holder_name=account_holder_name,
+        )
 
-    return normalize_receipt_payload(
-        parsed,
-        expense_categories,
-        expense_fallback_id,
-        income_categories,
-        income_fallback_id,
-        account_holder_name=account_holder_name,
+    if provider == "gemini":
+        return _scan_gemini(
+            file_bytes, mime_type, prompt, api_key, model, normalize=normalize
+        )
+    return _scan_openai(
+        file_bytes, mime_type, prompt, api_key, model, normalize=normalize
     )

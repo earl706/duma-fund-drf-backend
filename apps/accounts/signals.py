@@ -1,10 +1,10 @@
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
-from .models import User, UserSecurity
+from .models import User, UserLlmSettings, UserSecurity
 
 # -----------------------------------------------------------------------------
-# User post-save: provision security
+# User post-save: provision security + LLM settings
 # -----------------------------------------------------------------------------
 
 
@@ -13,3 +13,4 @@ def ensure_security(sender, instance, created, **kwargs):
 
     if created:
         UserSecurity.objects.get_or_create(user=instance)
+        UserLlmSettings.objects.get_or_create(user=instance)

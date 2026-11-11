@@ -12,6 +12,7 @@ from .auth_extra import (
     RememberAwareTokenRefreshView,
 )
 from .email_views import ChangeEmailView, ResendVerificationView, VerifyEmailView
+from .llm_views import LlmKeysClearView, LlmSettingsView
 from .views import EmailTokenObtainPairView, MeView, RegisterView
 
 # -----------------------------------------------------------------------------
@@ -31,6 +32,8 @@ urlpatterns = [
 # -----------------------------------------------------------------------------
 urlpatterns += [
     path("me/", MeView.as_view(), name="me"),
+    path("llm/", LlmSettingsView.as_view(), name="llm-settings"),
+    path("llm/keys/", LlmKeysClearView.as_view(), name="llm-keys-clear"),
 ]
 
 # -----------------------------------------------------------------------------
