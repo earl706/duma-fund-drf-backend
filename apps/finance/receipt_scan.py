@@ -90,6 +90,15 @@ Available expense categories (retail_receipt only; use these ids only):
 Available income categories (bank_slip income rows only; use these ids only):
 {income_catalog}
 
+Readable naming (retail merchant/item titles AND bank entry title/merchant):
+- Emit human-readable Title Case — never ALL CAPS dumps or glued tokens
+- Insert spaces between words and before size / weight / volume suffixes
+- Prefer conventional unit casing in names (g, kg, mL, L), e.g. "900mL" not "900ml"
+- Fix OCR mashups into spaced words when the product is clear
+  Good: "7/11", "DM Peppermint 23.8g", "Pocari Sweat 900mL"
+  Bad:  "7-ELEVEN", "DMPeprmint35s23.8g", "PocariSweat900ml"
+- Do not invent brands; only reformat what the document shows
+
 Retail rules:
 - cost = UNIT PRICE (not line total)
 - quantity = number of units purchased
@@ -100,7 +109,7 @@ Retail rules:
 - Use decimal strings; cost with 2 decimal places
 - Pick the closest category_id for the receipt and each line from the expense list
   (line categories are suggestions; they will be merged onto the receipt header)
-- merchant = store / vendor name printed on the receipt
+- merchant = store / vendor name (readable Title Case; see naming rules)
 
 Bank / transfer rules:
 - Extract EVERY visible money movement row (passbook pages and history screens may have many)
@@ -116,8 +125,10 @@ Bank / transfer rules:
 - Prefer income for clear earnings; prefer transfer_in/out for person-to-person moves
 - amount = main transaction amount only (positive; skip standalone fee rows unless that is the only amount)
 - title MUST include available counterparty/sender/recipient, reference/trace number, and
-  masked account / last-4 when present (join with " · "; omit missing parts)
-- merchant = bank, remittance house, or e-wallet app name (generic — any PH bank/app)
+  masked account / last-4 when present (join with " · "; omit missing parts);
+  apply readable Title Case to name parts (see naming rules)
+- merchant = bank, remittance house, or e-wallet app name (readable Title Case;
+  generic — any PH bank/app)
 - note = purpose / remarks / message if shown; otherwise ""
 - category_id required suggestion only when txn_type is income; null for transfers
 - Use decimal strings with 2 decimal places for amount

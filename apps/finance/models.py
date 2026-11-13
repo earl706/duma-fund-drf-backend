@@ -315,6 +315,8 @@ class Transaction(OwnedModel):
     receipt_image = models.ImageField(
         upload_to="receipts/%Y/%m/", blank=True, null=True
     )
+    # True when logged expense lines are intentionally incomplete vs the receipt.
+    is_partial = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     date_created = models.DateField(default=today)
     date_effective = models.DateField(default=today)

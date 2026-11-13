@@ -87,6 +87,11 @@ def parse_commit_payload(data):
     source_id = data.get("source_id")
     if source_id not in ("", None):
         payload["source_id"] = source_id
+    is_partial = data.get("is_partial")
+    if isinstance(is_partial, str):
+        payload["is_partial"] = is_partial.strip().lower() in ("1", "true", "yes", "on")
+    elif is_partial is not None:
+        payload["is_partial"] = bool(is_partial)
     return payload
 
 
@@ -310,6 +315,7 @@ class CommitReceiptMixin:
         merchant = (payload.get("merchant") or payload.get("title") or "").strip()
         title = (payload.get("title") or merchant or "Receipt").strip()
         note = payload.get("note") or ""
+        is_partial = bool(payload.get("is_partial"))
         source = resolve_transaction_source(
             profile, source_id=payload.get("source_id"), merchant=merchant
         )
@@ -326,6 +332,7 @@ class CommitReceiptMixin:
                 note=note,
                 source=source,
                 category=header_cat,
+                is_partial=is_partial,
                 date_created=today(),
                 date_effective=effective,
             )

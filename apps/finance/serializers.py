@@ -427,6 +427,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "category",
             "categories",
             "receipt_image",
+            "is_partial",
             "status",
             "date_created",
             "date_effective",
@@ -556,6 +557,9 @@ class TransactionSerializer(serializers.ModelSerializer):
             attrs["category"] = None
             attrs.pop("categories", None)
             attrs["_clear_categories"] = True
+
+        if txn_type != "expense":
+            attrs["is_partial"] = False
 
         amount = attrs.get("amount", getattr(self.instance, "amount", None))
         if amount is not None and amount < 0:
@@ -696,6 +700,7 @@ class CommitReceiptSerializer(serializers.Serializer):
     )
     date_effective = serializers.DateField(required=False)
     source_id = serializers.IntegerField(required=False, allow_null=True)
+    is_partial = serializers.BooleanField(required=False, default=False)
     items = DraftTransactionItemSerializer(many=True, required=False, allow_empty=True)
     entries = CommitBankEntrySerializer(many=True, required=False, allow_empty=True)
 

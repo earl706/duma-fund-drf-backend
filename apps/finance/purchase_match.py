@@ -36,6 +36,15 @@ SIZE_TOKEN_RE = re.compile(
 
 PUNCT_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 SPACE_RE = re.compile(r"\s+")
+# Soft-split glued OCR / camelCase before normalizing (PocariSweat900ml → tokens).
+# Protect size units first so 900mL / 23.8g are not split into "900 m L".
+UNIT_RUN_RE = re.compile(
+    r"(?i)\d+(?:[.,]\d+)?(?:kg|g|ml|l|pcs?|pc|pack|pk)\b"
+)
+CAMEL_RE = re.compile(r"([a-z])([A-Z])")
+LETTER_DIGIT_RE = re.compile(r"([A-Za-z])(\d)")
+DIGIT_LETTER_RE = re.compile(r"(\d)([A-Za-z])")
+COMPACT_RE = re.compile(r"\s+")
 
 REGULAR_LOOKBACK_DAYS = 30
 MIN_AUTO_REGULAR_COUNT = 2
@@ -43,20 +52,43 @@ DUE_SOON_RATIO = 0.8
 TOKEN_OVERLAP_THRESHOLD = 0.55
 
 
+def _soft_split_glued(text: str) -> str:
+    protected: list[str] = []
+
+    def _stash(match: re.Match) -> str:
+        protected.append(match.group(0))
+        # Digit-only markers so letter↔digit splits do not corrupt placeholders.
+        return f" <<<{len(protected) - 1}>>> "
+
+    text = UNIT_RUN_RE.sub(_stash, text)
+    text = CAMEL_RE.sub(r"\1 \2", text)
+    text = LETTER_DIGIT_RE.sub(r"\1 \2", text)
+    text = DIGIT_LETTER_RE.sub(r"\1 \2", text)
+    for index, unit in enumerate(protected):
+        text = text.replace(f"<<<{index}>>>", unit)
+    return text
+
+
 def normalize_title(value: str | None) -> str:
     if not value:
         return ""
-    text = value.strip().lower()
+    text = _soft_split_glued(value.strip())
+    text = text.lower()
     text = PUNCT_RE.sub(" ", text)
     text = SPACE_RE.sub(" ", text).strip()
     return text
+
+
+def compact_title(value: str | None) -> str:
+    """Whitespace-free form so spaced OCR matches older glued titles."""
+    return COMPACT_RE.sub("", normalize_title(value))
 
 
 def family_key(value: str | None) -> str:
     """Size/pack-stripped key; strip size tokens before punctuation so 1.5L survives."""
     if not value:
         return ""
-    text = value.strip().lower()
+    text = _soft_split_glued(value.strip()).lower()
     text = SIZE_TOKEN_RE.sub(" ", text)
     text = PUNCT_RE.sub(" ", text)
     text = SPACE_RE.sub(" ", text).strip()
@@ -413,6 +445,9 @@ def score_query_against_title(
         return 0.0, "none"
     if query_norm == title_norm:
         return 1.0, "exact"
+    # Spaced Title Case OCR vs older glued receipt text (same letters/digits).
+    if compact_title(query_norm) == compact_title(title_norm):
+        return 0.92, "fuzzy"
     overlap = token_overlap(query_norm, title_norm)
     if overlap >= TOKEN_OVERLAP_THRESHOLD:
         return 0.7 + 0.25 * overlap, "fuzzy"
