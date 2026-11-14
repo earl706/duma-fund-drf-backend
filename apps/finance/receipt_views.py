@@ -111,25 +111,84 @@ def llm_override_from_request(request):
 
 def resolve_llm_override(request):
     """
-    Merge order: request override api_key/provider/model, then encrypted
-    UserLlmSettings, then (inside receipt_scan) server env.
+    Single merged override (legacy). Prefer resolve_llm_attempts for scans.
+    Merge order: request override, then encrypted UserLlmSettings, then env.
     """
-    from apps.accounts.llm_views import active_llm_override_for_user
+    primary, attempts = resolve_llm_attempts(request)
+    if not attempts:
+        return None
+    first = attempts[0]
+    if first is None:
+        return None
+    return first
+
+
+def resolve_llm_attempts(request):
+    """
+    Build ordered LLM attempts for a scan.
+
+    - Explicit request api_key → single attempt (no multi-provider hop).
+    - Else account-saved keys: active first, then openai→gemini→groq→openrouter.
+    - Else legacy active override (may rely on server env) as one attempt.
+
+    Returns (primary_provider, [override_dict | None, ...]).
+    """
+    from apps.accounts.llm_views import (
+        active_llm_override_for_user,
+        saved_llm_override_chain,
+    )
+
+    req = llm_override_from_request(request) or {}
+    primary, chain = saved_llm_override_chain(request.user)
+
+    if req.get("api_key"):
+        provider = req.get("provider") or primary
+        model = req.get("model")
+        if not model:
+            for row in chain:
+                if row["provider"] == provider:
+                    model = row.get("model")
+                    break
+            if not model:
+                stored = active_llm_override_for_user(request.user) or {}
+                if stored.get("provider") == provider:
+                    model = stored.get("model")
+        return primary, [
+            {
+                "provider": provider,
+                "api_key": req["api_key"],
+                "model": model or None,
+            }
+        ]
+
+    if chain:
+        if req.get("provider"):
+            # Reorder so request provider leads when it has a saved key.
+            lead = req["provider"]
+            headed = [row for row in chain if row["provider"] == lead]
+            rest = [row for row in chain if row["provider"] != lead]
+            chain = headed + rest if headed else chain
+        if req.get("model") and chain:
+            # Apply model override only to the first (preferred) attempt.
+            first = dict(chain[0])
+            first["model"] = req["model"]
+            chain = [first, *chain[1:]]
+        return primary, chain
 
     stored = active_llm_override_for_user(request.user) or {}
-    req = llm_override_from_request(request) or {}
+    if req.get("provider"):
+        stored = {
+            "provider": req["provider"],
+            "api_key": stored.get("api_key") if stored.get("provider") == req["provider"] else None,
+            "model": req.get("model") or stored.get("model"),
+        }
+    elif req.get("model") and stored:
+        stored = {**stored, "model": req["model"]}
     if not stored and not req:
-        return None
-    provider = req.get("provider") or stored.get("provider")
-    api_key = req.get("api_key") or stored.get("api_key")
-    model = req.get("model") or stored.get("model")
-    if not (provider or api_key or model):
-        return None
-    return {
-        "provider": provider or None,
-        "api_key": api_key or None,
-        "model": model or None,
-    }
+        return primary, [None]
+    if not (stored.get("provider") or stored.get("api_key") or stored.get("model")):
+        return primary, [None]
+    return primary, [stored]
 
 
 def collect_bulk_images(request, count):
@@ -165,14 +224,15 @@ class ReceiptScanView(ProfileScopedAPIView):
 
         file_bytes = upload.read()
         mime_type = upload.content_type or "image/jpeg"
-        llm_override = resolve_llm_override(request)
+        primary, llm_attempts = resolve_llm_attempts(request)
 
         try:
             draft = scan_receipt_image(
                 file_bytes,
                 mime_type,
                 request.user,
-                llm_override=llm_override,
+                llm_attempts=llm_attempts,
+                primary_provider=primary,
                 profile=self.get_profile(),
             )
         except RuntimeError as exc:
@@ -220,7 +280,7 @@ class BulkScanReceiptView(ProfileScopedAPIView):
             )
 
         images = collect_bulk_images(request, count)
-        llm_override = resolve_llm_override(request)
+        primary, llm_attempts = resolve_llm_attempts(request)
         results = []
         ok_count = 0
         for index, (file_bytes, mime_type, _name) in enumerate(images):
@@ -229,9 +289,11 @@ class BulkScanReceiptView(ProfileScopedAPIView):
                     file_bytes,
                     mime_type,
                     request.user,
-                    llm_override=llm_override,
+                    llm_attempts=llm_attempts,
+                    primary_provider=primary,
                     profile=self.get_profile(),
                 )
+                llm_used = draft.pop("llm_used", None)
                 kind = draft.get("document_kind") or (
                     "bank_slip" if draft.get("entries") else "retail_receipt"
                 )
@@ -254,7 +316,10 @@ class BulkScanReceiptView(ProfileScopedAPIView):
                         }
                     )
                     continue
-                results.append({"index": index, "ok": True, "draft": draft})
+                row = {"index": index, "ok": True, "draft": draft}
+                if llm_used:
+                    row["llm_used"] = llm_used
+                results.append(row)
                 ok_count += 1
             except RuntimeError as exc:
                 results.append({"index": index, "ok": False, "detail": str(exc)})

@@ -13,6 +13,19 @@ LLM_PROVIDERS = {
     UserLlmSettings.PROVIDER_GROQ,
     UserLlmSettings.PROVIDER_OPENROUTER,
 }
+# Fixed UI / failover order after the user's active provider.
+LLM_FALLBACK_ORDER = (
+    UserLlmSettings.PROVIDER_OPENAI,
+    UserLlmSettings.PROVIDER_GEMINI,
+    UserLlmSettings.PROVIDER_GROQ,
+    UserLlmSettings.PROVIDER_OPENROUTER,
+)
+LLM_PROVIDER_LABELS = {
+    UserLlmSettings.PROVIDER_OPENAI: "OpenAI",
+    UserLlmSettings.PROVIDER_GEMINI: "Gemini",
+    UserLlmSettings.PROVIDER_GROQ: "Groq",
+    UserLlmSettings.PROVIDER_OPENROUTER: "OpenRouter",
+}
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
@@ -73,14 +86,18 @@ def looks_like_masked_key(value: str) -> bool:
     return False
 
 
+def _normalize_provider(raw: str | None) -> str:
+    provider = (raw or UserLlmSettings.PROVIDER_OPENAI).strip().lower()
+    if provider not in LLM_PROVIDERS:
+        return UserLlmSettings.PROVIDER_OPENAI
+    return provider
+
+
 def active_llm_override_for_user(user) -> dict | None:
     """Decrypt stored credentials for receipt scan (no plaintext in API responses)."""
     row = get_user_llm_settings(user)
 
-    provider = (row.provider or UserLlmSettings.PROVIDER_OPENAI).strip().lower()
-    if provider not in LLM_PROVIDERS:
-        provider = UserLlmSettings.PROVIDER_OPENAI
-
+    provider = _normalize_provider(row.provider)
     fields = _PROVIDER_FIELDS[provider]
     api_key = decrypt_secret(getattr(row, fields["encrypted"]))
     model = (getattr(row, fields["model"]) or fields["default_model"]).strip()
@@ -90,6 +107,39 @@ def active_llm_override_for_user(user) -> dict | None:
         return {"provider": provider, "api_key": None, "model": model or None}
 
     return {"provider": provider, "api_key": api_key, "model": model or None}
+
+
+def saved_llm_override_chain(user) -> tuple[str, list[dict]]:
+    """
+    Active provider first, then LLM_FALLBACK_ORDER.
+    Only providers with an account-saved API key are included (no env keys).
+    Returns (primary_provider, [{provider, api_key, model}, ...]).
+    """
+    row = get_user_llm_settings(user)
+    primary = _normalize_provider(row.provider)
+
+    by_provider: dict[str, dict] = {}
+    for provider in LLM_FALLBACK_ORDER:
+        fields = _PROVIDER_FIELDS[provider]
+        api_key = decrypt_secret(getattr(row, fields["encrypted"]))
+        if not api_key:
+            continue
+        model = (getattr(row, fields["model"]) or fields["default_model"]).strip()
+        by_provider[provider] = {
+            "provider": provider,
+            "api_key": api_key,
+            "model": model or None,
+        }
+
+    ordered: list[dict] = []
+    if primary in by_provider:
+        ordered.append(by_provider[primary])
+    for provider in LLM_FALLBACK_ORDER:
+        if provider == primary:
+            continue
+        if provider in by_provider:
+            ordered.append(by_provider[provider])
+    return primary, ordered
 
 
 class LlmSettingsView(APIView):

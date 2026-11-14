@@ -758,8 +758,31 @@ def _scan_gemini(file_bytes, mime_type, prompt, api_key, model, normalize=None):
     )
 
 
-def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=None):
-    """Call vision provider; return normalized draft (retail or bank)."""
+def _provider_label(provider):
+    labels = {
+        "openai": "OpenAI",
+        "gemini": "Gemini",
+        "groq": "Groq",
+        "openrouter": "OpenRouter",
+    }
+    return labels.get(provider, provider or "provider")
+
+
+def scan_receipt_image(
+    file_bytes,
+    mime_type,
+    user,
+    llm_override=None,
+    llm_attempts=None,
+    primary_provider=None,
+    profile=None,
+):
+    """
+    Call vision provider(s); return normalized draft (retail or bank).
+
+    When llm_attempts has multiple saved-key overrides, try each in order after
+    that provider's own retries are exhausted. Attaches draft['llm_used'].
+    """
     _validate_image(file_bytes, mime_type)
     if profile is None:
         profile = ensure_finance_ready(user)
@@ -784,7 +807,6 @@ def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=N
     prompt = build_receipt_prompt(
         expense_categories, income_categories, account_holder_name
     )
-    provider, api_key, model = _resolve_provider(llm_override)
 
     def normalize(parsed):
         return normalize_receipt_payload(
@@ -796,16 +818,52 @@ def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=N
             account_holder_name=account_holder_name,
         )
 
-    if provider == "gemini":
-        return _scan_gemini(
-            file_bytes, mime_type, prompt, api_key, model, normalize=normalize
-        )
-    return _scan_openai_compat(
-        file_bytes,
-        mime_type,
-        prompt,
-        api_key,
-        model,
-        provider=provider,
-        normalize=normalize,
-    )
+    if llm_attempts is None:
+        attempts = [llm_override]
+    else:
+        attempts = list(llm_attempts) or [None]
+
+    primary = (primary_provider or "").strip().lower() or None
+    if not primary and attempts and isinstance(attempts[0], dict):
+        primary = (attempts[0].get("provider") or "").strip().lower() or None
+
+    last_error = None
+    for override in attempts:
+        try:
+            provider, api_key, model = _resolve_provider(override)
+        except RuntimeError as exc:
+            last_error = exc
+            continue
+
+        try:
+            if provider == "gemini":
+                draft = _scan_gemini(
+                    file_bytes, mime_type, prompt, api_key, model, normalize=normalize
+                )
+            else:
+                draft = _scan_openai_compat(
+                    file_bytes,
+                    mime_type,
+                    prompt,
+                    api_key,
+                    model,
+                    provider=provider,
+                    normalize=normalize,
+                )
+        except (RuntimeError, ValueError) as exc:
+            last_error = exc
+            continue
+
+        used_primary = primary or provider
+        draft["llm_used"] = {
+            "provider": provider,
+            "primary": used_primary,
+            "fallback": provider != used_primary,
+            "label": _provider_label(provider),
+            "primary_label": _provider_label(used_primary),
+        }
+        return draft
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No Receipt AI provider is configured.")

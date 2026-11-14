@@ -5,7 +5,10 @@ from django.contrib.auth import get_user_model
 from rest_framework.test import APITestCase
 
 from apps.accounts.llm_crypto import decrypt_secret, encrypt_secret, key_last4
-from apps.accounts.llm_views import active_llm_override_for_user
+from apps.accounts.llm_views import (
+    active_llm_override_for_user,
+    saved_llm_override_chain,
+)
 from apps.accounts.models import UserLlmSettings, get_user_llm_settings
 from apps.finance.models import BudgetProfile, BudgetProfileMembership
 from apps.finance.seeds import ensure_finance_ready
@@ -217,6 +220,39 @@ class LlmSettingsApiTests(APITestCase):
         self.assertEqual(
             override["model"], "nvidia/nemotron-3.5-super-vl:free"
         )
+
+    def test_saved_llm_override_chain_active_first_then_ui_order(self):
+        self.client.patch(
+            "/api/auth/llm/",
+            {
+                "provider": "gemini",
+                "openai_api_key": "sk-openai-1111",
+                "gemini_api_key": "AIza-gemini-2222",
+                "groq_api_key": "gsk-groq-3333",
+                # openrouter intentionally omitted
+            },
+            format="json",
+        )
+        primary, chain = saved_llm_override_chain(self.user)
+        self.assertEqual(primary, "gemini")
+        self.assertEqual([row["provider"] for row in chain], ["gemini", "openai", "groq"])
+        self.assertEqual(chain[0]["api_key"], "AIza-gemini-2222")
+        self.assertEqual(chain[1]["api_key"], "sk-openai-1111")
+        self.assertEqual(chain[2]["api_key"], "gsk-groq-3333")
+
+    def test_saved_llm_override_chain_skips_primary_without_key(self):
+        self.client.patch(
+            "/api/auth/llm/",
+            {
+                "provider": "gemini",
+                "openai_api_key": "sk-openai-1111",
+                "groq_api_key": "gsk-groq-3333",
+            },
+            format="json",
+        )
+        primary, chain = saved_llm_override_chain(self.user)
+        self.assertEqual(primary, "gemini")
+        self.assertEqual([row["provider"] for row in chain], ["openai", "groq"])
 
     def test_invalid_provider_rejected(self):
         res = self.client.patch(
