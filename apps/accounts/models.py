@@ -90,9 +90,13 @@ class UserLlmSettings(models.Model):
 
     PROVIDER_OPENAI = "openai"
     PROVIDER_GEMINI = "gemini"
+    PROVIDER_GROQ = "groq"
+    PROVIDER_OPENROUTER = "openrouter"
     PROVIDER_CHOICES = (
         (PROVIDER_OPENAI, "OpenAI"),
         (PROVIDER_GEMINI, "Gemini"),
+        (PROVIDER_GROQ, "Groq"),
+        (PROVIDER_OPENROUTER, "OpenRouter"),
     )
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="llm")
@@ -101,10 +105,18 @@ class UserLlmSettings(models.Model):
     )
     openai_api_key_encrypted = models.TextField(blank=True)
     openai_api_key_last4 = models.CharField(max_length=4, blank=True)
-    openai_model = models.CharField(max_length=64, default="gpt-4o-mini")
+    openai_model = models.CharField(max_length=128, default="gpt-4o-mini")
     gemini_api_key_encrypted = models.TextField(blank=True)
     gemini_api_key_last4 = models.CharField(max_length=4, blank=True)
-    gemini_model = models.CharField(max_length=64, default="gemini-3.5-flash")
+    gemini_model = models.CharField(max_length=128, default="gemini-3.5-flash")
+    groq_api_key_encrypted = models.TextField(blank=True)
+    groq_api_key_last4 = models.CharField(max_length=4, blank=True)
+    groq_model = models.CharField(max_length=128, default="qwen/qwen3.8-27b")
+    openrouter_api_key_encrypted = models.TextField(blank=True)
+    openrouter_api_key_last4 = models.CharField(max_length=4, blank=True)
+    openrouter_model = models.CharField(
+        max_length=128, default="nvidia/nemotron-3.5-super-vl:free"
+    )
 
     def __str__(self):
         return f"LLM<{self.user.email}>"

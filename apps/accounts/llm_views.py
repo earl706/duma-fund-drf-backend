@@ -7,9 +7,43 @@ from rest_framework.views import APIView
 from .llm_crypto import decrypt_secret, encrypt_secret, key_last4
 from .models import UserLlmSettings, get_user_llm_settings
 
-LLM_PROVIDERS = {UserLlmSettings.PROVIDER_OPENAI, UserLlmSettings.PROVIDER_GEMINI}
+LLM_PROVIDERS = {
+    UserLlmSettings.PROVIDER_OPENAI,
+    UserLlmSettings.PROVIDER_GEMINI,
+    UserLlmSettings.PROVIDER_GROQ,
+    UserLlmSettings.PROVIDER_OPENROUTER,
+}
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b"
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl:free"
+
+_PROVIDER_FIELDS = {
+    UserLlmSettings.PROVIDER_OPENAI: {
+        "encrypted": "openai_api_key_encrypted",
+        "last4": "openai_api_key_last4",
+        "model": "openai_model",
+        "default_model": DEFAULT_OPENAI_MODEL,
+    },
+    UserLlmSettings.PROVIDER_GEMINI: {
+        "encrypted": "gemini_api_key_encrypted",
+        "last4": "gemini_api_key_last4",
+        "model": "gemini_model",
+        "default_model": DEFAULT_GEMINI_MODEL,
+    },
+    UserLlmSettings.PROVIDER_GROQ: {
+        "encrypted": "groq_api_key_encrypted",
+        "last4": "groq_api_key_last4",
+        "model": "groq_model",
+        "default_model": DEFAULT_GROQ_MODEL,
+    },
+    UserLlmSettings.PROVIDER_OPENROUTER: {
+        "encrypted": "openrouter_api_key_encrypted",
+        "last4": "openrouter_api_key_last4",
+        "model": "openrouter_model",
+        "default_model": DEFAULT_OPENROUTER_MODEL,
+    },
+}
 
 
 def serialize_llm_settings(row: UserLlmSettings) -> dict:
@@ -17,10 +51,16 @@ def serialize_llm_settings(row: UserLlmSettings) -> dict:
         "provider": row.provider,
         "openai_model": row.openai_model or DEFAULT_OPENAI_MODEL,
         "gemini_model": row.gemini_model or DEFAULT_GEMINI_MODEL,
+        "groq_model": row.groq_model or DEFAULT_GROQ_MODEL,
+        "openrouter_model": row.openrouter_model or DEFAULT_OPENROUTER_MODEL,
         "openai_key_set": bool(row.openai_api_key_encrypted),
         "openai_key_hint": row.openai_api_key_last4 or "",
         "gemini_key_set": bool(row.gemini_api_key_encrypted),
         "gemini_key_hint": row.gemini_api_key_last4 or "",
+        "groq_key_set": bool(row.groq_api_key_encrypted),
+        "groq_key_hint": row.groq_api_key_last4 or "",
+        "openrouter_key_set": bool(row.openrouter_api_key_encrypted),
+        "openrouter_key_hint": row.openrouter_api_key_last4 or "",
     }
 
 
@@ -41,12 +81,9 @@ def active_llm_override_for_user(user) -> dict | None:
     if provider not in LLM_PROVIDERS:
         provider = UserLlmSettings.PROVIDER_OPENAI
 
-    if provider == UserLlmSettings.PROVIDER_GEMINI:
-        api_key = decrypt_secret(row.gemini_api_key_encrypted)
-        model = (row.gemini_model or DEFAULT_GEMINI_MODEL).strip()
-    else:
-        api_key = decrypt_secret(row.openai_api_key_encrypted)
-        model = (row.openai_model or DEFAULT_OPENAI_MODEL).strip()
+    fields = _PROVIDER_FIELDS[provider]
+    api_key = decrypt_secret(getattr(row, fields["encrypted"]))
+    model = (getattr(row, fields["model"]) or fields["default_model"]).strip()
 
     if not api_key:
         # Still pass provider/model so env key uses the user's chosen model.
@@ -71,35 +108,68 @@ class LlmSettingsView(APIView):
             provider = str(provider).strip().lower()
             if provider not in LLM_PROVIDERS:
                 return Response(
-                    {"provider": "Must be openai or gemini."},
+                    {
+                        "provider": (
+                            "Must be openai, gemini, groq, or openrouter."
+                        )
+                    },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             row.provider = provider
 
-        if "openai_model" in data:
-            model = str(data.get("openai_model") or "").strip()
-            row.openai_model = model or DEFAULT_OPENAI_MODEL
+        model_defaults = {
+            "openai_model": DEFAULT_OPENAI_MODEL,
+            "gemini_model": DEFAULT_GEMINI_MODEL,
+            "groq_model": DEFAULT_GROQ_MODEL,
+            "openrouter_model": DEFAULT_OPENROUTER_MODEL,
+        }
+        for field, default in model_defaults.items():
+            if field in data:
+                model = str(data.get(field) or "").strip()
+                setattr(row, field, model or default)
 
-        if "gemini_model" in data:
-            model = str(data.get("gemini_model") or "").strip()
-            row.gemini_model = model or DEFAULT_GEMINI_MODEL
-
-        if "openai_api_key" in data:
-            raw = str(data.get("openai_api_key") or "")
-            if not looks_like_masked_key(raw):
-                key = raw.strip()
-                row.openai_api_key_encrypted = encrypt_secret(key)
-                row.openai_api_key_last4 = key_last4(key)
-
-        if "gemini_api_key" in data:
-            raw = str(data.get("gemini_api_key") or "")
-            if not looks_like_masked_key(raw):
-                key = raw.strip()
-                row.gemini_api_key_encrypted = encrypt_secret(key)
-                row.gemini_api_key_last4 = key_last4(key)
+        key_fields = (
+            ("openai_api_key", "openai_api_key_encrypted", "openai_api_key_last4"),
+            ("gemini_api_key", "gemini_api_key_encrypted", "gemini_api_key_last4"),
+            ("groq_api_key", "groq_api_key_encrypted", "groq_api_key_last4"),
+            (
+                "openrouter_api_key",
+                "openrouter_api_key_encrypted",
+                "openrouter_api_key_last4",
+            ),
+        )
+        for raw_key, encrypted_attr, last4_attr in key_fields:
+            if raw_key not in data:
+                continue
+            raw = str(data.get(raw_key) or "")
+            if looks_like_masked_key(raw):
+                continue
+            key = raw.strip()
+            setattr(row, encrypted_attr, encrypt_secret(key))
+            setattr(row, last4_attr, key_last4(key))
 
         row.save()
         return Response(serialize_llm_settings(row))
+
+
+_PROVIDER_KEY_FIELDS = {
+    UserLlmSettings.PROVIDER_OPENAI: (
+        "openai_api_key_encrypted",
+        "openai_api_key_last4",
+    ),
+    UserLlmSettings.PROVIDER_GEMINI: (
+        "gemini_api_key_encrypted",
+        "gemini_api_key_last4",
+    ),
+    UserLlmSettings.PROVIDER_GROQ: (
+        "groq_api_key_encrypted",
+        "groq_api_key_last4",
+    ),
+    UserLlmSettings.PROVIDER_OPENROUTER: (
+        "openrouter_api_key_encrypted",
+        "openrouter_api_key_last4",
+    ),
+}
 
 
 class LlmKeysClearView(APIView):
@@ -107,16 +177,27 @@ class LlmKeysClearView(APIView):
 
     def delete(self, request):
         row = get_user_llm_settings(request.user)
-        row.openai_api_key_encrypted = ""
-        row.openai_api_key_last4 = ""
-        row.gemini_api_key_encrypted = ""
-        row.gemini_api_key_last4 = ""
-        row.save(
-            update_fields=[
-                "openai_api_key_encrypted",
-                "openai_api_key_last4",
-                "gemini_api_key_encrypted",
-                "gemini_api_key_last4",
+        raw_provider = request.query_params.get("provider")
+        if raw_provider is not None:
+            provider = str(raw_provider).strip().lower()
+            if provider not in LLM_PROVIDERS:
+                return Response(
+                    {
+                        "provider": (
+                            "Must be openai, gemini, groq, or openrouter."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            fields = list(_PROVIDER_KEY_FIELDS[provider])
+        else:
+            fields = [
+                field
+                for pair in _PROVIDER_KEY_FIELDS.values()
+                for field in pair
             ]
-        )
+
+        for field in fields:
+            setattr(row, field, "")
+        row.save(update_fields=fields)
         return Response(serialize_llm_settings(row))

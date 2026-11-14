@@ -78,9 +78,17 @@ class LlmSettingsApiTests(APITestCase):
         self.assertEqual(body["provider"], "openai")
         self.assertFalse(body["openai_key_set"])
         self.assertFalse(body["gemini_key_set"])
+        self.assertFalse(body["groq_key_set"])
+        self.assertFalse(body["openrouter_key_set"])
         self.assertEqual(body["openai_key_hint"], "")
+        self.assertEqual(body["groq_model"], "qwen/qwen3.8-27b")
+        self.assertEqual(
+            body["openrouter_model"], "nvidia/nemotron-3.5-super-vl:free"
+        )
         self.assertNotIn("openai_api_key", body)
         self.assertNotIn("openai_api_key_encrypted", body)
+        self.assertNotIn("groq_api_key", body)
+        self.assertNotIn("openrouter_api_key", body)
 
     def test_patch_stores_encrypted_key_and_last4(self):
         res = self.client.patch(
@@ -123,12 +131,14 @@ class LlmSettingsApiTests(APITestCase):
         row = get_user_llm_settings(self.user)
         self.assertEqual(decrypt_secret(row.openai_api_key_encrypted), "sk-real-key-9999")
 
-    def test_delete_keys_clears_both(self):
+    def test_delete_keys_clears_all(self):
         self.client.patch(
             "/api/auth/llm/",
             {
                 "openai_api_key": "sk-openai",
                 "gemini_api_key": "AIza-gemini",
+                "groq_api_key": "gsk-groq",
+                "openrouter_api_key": "sk-or-openrouter",
             },
             format="json",
         )
@@ -137,9 +147,84 @@ class LlmSettingsApiTests(APITestCase):
         body = res.json()
         self.assertFalse(body["openai_key_set"])
         self.assertFalse(body["gemini_key_set"])
+        self.assertFalse(body["groq_key_set"])
+        self.assertFalse(body["openrouter_key_set"])
         row = UserLlmSettings.objects.get(user=self.user)
         self.assertEqual(row.openai_api_key_encrypted, "")
         self.assertEqual(row.gemini_api_key_encrypted, "")
+        self.assertEqual(row.groq_api_key_encrypted, "")
+        self.assertEqual(row.openrouter_api_key_encrypted, "")
+
+    def test_delete_keys_clears_one_provider(self):
+        self.client.patch(
+            "/api/auth/llm/",
+            {
+                "openai_api_key": "sk-openai",
+                "groq_api_key": "gsk-groq",
+            },
+            format="json",
+        )
+        res = self.client.delete("/api/auth/llm/keys/?provider=groq")
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertTrue(body["openai_key_set"])
+        self.assertFalse(body["groq_key_set"])
+        row = UserLlmSettings.objects.get(user=self.user)
+        self.assertTrue(row.openai_api_key_encrypted)
+        self.assertEqual(row.groq_api_key_encrypted, "")
+
+    def test_patch_groq_and_override(self):
+        res = self.client.patch(
+            "/api/auth/llm/",
+            {
+                "provider": "groq",
+                "groq_api_key": "gsk-live-abcdef9999",
+                "groq_model": "qwen/qwen3.8-27b",
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["provider"], "groq")
+        self.assertTrue(body["groq_key_set"])
+        self.assertEqual(body["groq_key_hint"], "9999")
+        self.assertNotIn("groq_api_key", body)
+
+        override = active_llm_override_for_user(self.user)
+        self.assertEqual(override["provider"], "groq")
+        self.assertEqual(override["api_key"], "gsk-live-abcdef9999")
+        self.assertEqual(override["model"], "qwen/qwen3.8-27b")
+
+    def test_patch_openrouter_and_override(self):
+        res = self.client.patch(
+            "/api/auth/llm/",
+            {
+                "provider": "openrouter",
+                "openrouter_api_key": "sk-or-v1-abcdef8888",
+                "openrouter_model": "nvidia/nemotron-3.5-super-vl:free",
+            },
+            format="json",
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(body["provider"], "openrouter")
+        self.assertTrue(body["openrouter_key_set"])
+        self.assertEqual(body["openrouter_key_hint"], "8888")
+
+        override = active_llm_override_for_user(self.user)
+        self.assertEqual(override["provider"], "openrouter")
+        self.assertEqual(override["api_key"], "sk-or-v1-abcdef8888")
+        self.assertEqual(
+            override["model"], "nvidia/nemotron-3.5-super-vl:free"
+        )
+
+    def test_invalid_provider_rejected(self):
+        res = self.client.patch(
+            "/api/auth/llm/",
+            {"provider": "claude"},
+            format="json",
+        )
+        self.assertEqual(res.status_code, 400)
 
     def test_unauthenticated_rejected(self):
         self.client.force_authenticate(user=None)

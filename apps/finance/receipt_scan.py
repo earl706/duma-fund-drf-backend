@@ -460,6 +460,43 @@ def _parse_model_json(content):
         raise ValueError("Could not parse receipt response.") from exc
 
 
+_OPENAI_COMPAT_PROVIDERS = frozenset({"openai", "groq", "openrouter"})
+_ALL_RECEIPT_PROVIDERS = _OPENAI_COMPAT_PROVIDERS | {"gemini"}
+
+_OPENAI_COMPAT_ENDPOINTS = {
+    "openai": {
+        "base_url": None,
+        "default_headers": None,
+        "label": "OpenAI",
+        "env_key": "OPENAI_API_KEY",
+        "env_model": "OPENAI_RECEIPT_MODEL",
+        "default_model": "gpt-4o-mini",
+        "settings_hint": "Add an API key in Settings or set OPENAI_API_KEY.",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_headers": None,
+        "label": "Groq",
+        "env_key": None,
+        "env_model": None,
+        "default_model": "qwen/qwen3.8-27b",
+        "settings_hint": "Add a Groq API key in Settings.",
+    },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_headers": {
+            "HTTP-Referer": "https://dumafund.banto.space",
+            "X-Title": "DumaFund",
+        },
+        "label": "OpenRouter",
+        "env_key": None,
+        "env_model": None,
+        "default_model": "nvidia/nemotron-3.5-super-vl:free",
+        "settings_hint": "Add an OpenRouter API key in Settings.",
+    },
+}
+
+
 def _resolve_provider(override=None):
     override = override or {}
     provider = (
@@ -467,36 +504,38 @@ def _resolve_provider(override=None):
         .strip()
         .lower()
     )
-    if provider not in {"openai", "gemini"}:
+    if provider not in _ALL_RECEIPT_PROVIDERS:
         raise RuntimeError(
-            f"Invalid RECEIPT_PROVIDER '{provider}' (use openai or gemini)."
+            f"Invalid RECEIPT_PROVIDER '{provider}' "
+            "(use openai, gemini, groq, or openrouter)."
         )
 
     api_key = (override.get("api_key") or "").strip()
-    if provider == "openai":
-        if not api_key:
-            api_key = getattr(settings, "OPENAI_API_KEY", "") or ""
-        if not api_key:
-            raise RuntimeError(
-                "OpenAI is not configured. Add an API key in Settings or set OPENAI_API_KEY."
-            )
-    else:
+    model = (override.get("model") or "").strip()
+
+    if provider == "gemini":
         if not api_key:
             api_key = getattr(settings, "GEMINI_API_KEY", "") or ""
         if not api_key:
             raise RuntimeError(
                 "Gemini is not configured. Add an API key in Settings or set GEMINI_API_KEY."
             )
+        if not model:
+            model = getattr(settings, "GEMINI_RECEIPT_MODEL", "gemini-3.5-flash")
+        return provider, api_key, model
 
-    if provider == "openai":
-        model = (override.get("model") or "").strip() or getattr(
-            settings, "OPENAI_RECEIPT_MODEL", "gpt-4o-mini"
+    endpoint = _OPENAI_COMPAT_ENDPOINTS[provider]
+    if not api_key and endpoint["env_key"]:
+        api_key = getattr(settings, endpoint["env_key"], "") or ""
+    if not api_key:
+        raise RuntimeError(
+            f"{endpoint['label']} is not configured. {endpoint['settings_hint']}"
         )
-    else:
-        model = (override.get("model") or "").strip() or getattr(
-            settings, "GEMINI_RECEIPT_MODEL", "gemini-3.5-flash"
-        )
-
+    if not model:
+        if endpoint["env_model"]:
+            model = getattr(settings, endpoint["env_model"], endpoint["default_model"])
+        else:
+            model = endpoint["default_model"]
     return provider, api_key, model
 
 
@@ -552,7 +591,16 @@ def _gemini_response_text(response):
     return "\n".join(chunks).strip()
 
 
-def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
+def _scan_openai_compat(
+    file_bytes,
+    mime_type,
+    prompt,
+    api_key,
+    model,
+    *,
+    provider="openai",
+    normalize=None,
+):
     from openai import (
         APIConnectionError,
         APIStatusError,
@@ -561,8 +609,16 @@ def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
         RateLimitError,
     )
 
+    endpoint = _OPENAI_COMPAT_ENDPOINTS.get(provider) or _OPENAI_COMPAT_ENDPOINTS["openai"]
+    label = endpoint["label"]
+    client_kwargs = {"api_key": api_key, "timeout": 90.0, "max_retries": 0}
+    if endpoint["base_url"]:
+        client_kwargs["base_url"] = endpoint["base_url"]
+    if endpoint["default_headers"]:
+        client_kwargs["default_headers"] = endpoint["default_headers"]
+
     # max_retries=0: we own backoff so Gunicorn time budget stays predictable.
-    client = OpenAI(api_key=api_key, timeout=90.0, max_retries=0)
+    client = OpenAI(**client_kwargs)
     b64 = base64.b64encode(file_bytes).decode("ascii")
     data_url = f"data:{mime_type};base64,{b64}"
     messages = [
@@ -599,7 +655,7 @@ def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
                 _sleep_backoff(attempt)
                 continue
             raise RuntimeError(
-                "OpenAI is temporarily unavailable. Retry shortly."
+                f"{label} is temporarily unavailable. Retry shortly."
             ) from exc
         except APIStatusError as exc:
             last_error = exc
@@ -609,13 +665,25 @@ def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
                 continue
             if status in _OPENAI_TRANSIENT_STATUS:
                 raise RuntimeError(
-                    f"OpenAI is temporarily unavailable (HTTP {status}). Retry shortly."
+                    f"{label} is temporarily unavailable (HTTP {status}). Retry shortly."
                 ) from exc
-            raise ValueError(f"OpenAI request failed: {exc}") from exc
+            raise ValueError(f"{label} request failed: {exc}") from exc
 
     raise RuntimeError(
-        f"OpenAI is temporarily unavailable: {last_error}"
+        f"{label} is temporarily unavailable: {last_error}"
     ) from last_error
+
+
+def _scan_openai(file_bytes, mime_type, prompt, api_key, model, normalize=None):
+    return _scan_openai_compat(
+        file_bytes,
+        mime_type,
+        prompt,
+        api_key,
+        model,
+        provider="openai",
+        normalize=normalize,
+    )
 
 
 def _scan_gemini(file_bytes, mime_type, prompt, api_key, model, normalize=None):
@@ -732,6 +800,12 @@ def scan_receipt_image(file_bytes, mime_type, user, llm_override=None, profile=N
         return _scan_gemini(
             file_bytes, mime_type, prompt, api_key, model, normalize=normalize
         )
-    return _scan_openai(
-        file_bytes, mime_type, prompt, api_key, model, normalize=normalize
+    return _scan_openai_compat(
+        file_bytes,
+        mime_type,
+        prompt,
+        api_key,
+        model,
+        provider=provider,
+        normalize=normalize,
     )
