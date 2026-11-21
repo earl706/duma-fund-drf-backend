@@ -29,6 +29,7 @@ class UserSerializer(serializers.ModelSerializer):
             "full_name",
             "avatar_url",
             "timezone",
+            "default_transactions_view",
             "mfa_enabled",
             "show_mfa_prompt",
             "email_verified",

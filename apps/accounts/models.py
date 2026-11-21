@@ -44,9 +44,21 @@ class User(AbstractUser):
     uuid = models.UUIDField(
         default=uuid.uuid4, editable=False, unique=True, db_index=True
     )
+    VIEW_LIST = "list"
+    VIEW_CALENDAR = "calendar"
+    TRANSACTIONS_VIEW_CHOICES = (
+        (VIEW_LIST, "List"),
+        (VIEW_CALENDAR, "Calendar"),
+    )
+
     full_name = models.CharField(max_length=255, blank=True)
     avatar_url = models.URLField(blank=True)
     timezone = models.CharField(max_length=64, default="UTC")
+    default_transactions_view = models.CharField(
+        max_length=16,
+        choices=TRANSACTIONS_VIEW_CHOICES,
+        default=VIEW_LIST,
+    )
     google_id = models.CharField(max_length=64, blank=True, null=True, unique=True)
     github_id = models.CharField(max_length=64, blank=True, null=True, unique=True)
 

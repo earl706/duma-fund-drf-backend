@@ -14,6 +14,7 @@ from django.db.models import Count
 from django.utils import timezone
 
 from .models import (
+    PurchaseAlias,
     PurchaseExclusion,
     PurchaseRegularMark,
     Transaction,
@@ -186,6 +187,134 @@ def load_regular_marks(profile) -> dict[str, str]:
         for row in PurchaseRegularMark.objects.filter(profile=profile).only(
             "family_key", "display_title"
         )
+    }
+
+
+def load_alias_parents(profile) -> dict[str, str]:
+    """Raw alias_key → canonical_key edges (may need resolve_alias)."""
+    return {
+        row.alias_key: row.canonical_key
+        for row in PurchaseAlias.objects.filter(profile=profile).only(
+            "alias_key", "canonical_key"
+        )
+    }
+
+
+def resolve_alias(key: str, parents: dict[str, str]) -> str:
+    if not key:
+        return key
+    seen: set[str] = set()
+    current = key
+    while current in parents and parents[current] != current:
+        if current in seen:
+            break
+        seen.add(current)
+        current = parents[current]
+    return current
+
+
+def group_events_by_canonical(
+    events: Iterable[PurchaseEvent],
+    alias_parents: dict[str, str] | None = None,
+) -> dict[str, list[PurchaseEvent]]:
+    parents = alias_parents or {}
+    groups: dict[str, list[PurchaseEvent]] = defaultdict(list)
+    for event in events:
+        if not event.normalized_title:
+            continue
+        key = resolve_alias(event.normalized_title, parents)
+        groups[key].append(event)
+    return groups
+
+
+def _event_recency_key(event: PurchaseEvent):
+    return (
+        event.date_effective,
+        event.transaction_id or 0,
+        event.item_id or 0,
+    )
+
+
+def merge_purchase_titles(profile, owner, titles: list[str]) -> dict:
+    """Alias selected normalized titles under the most recently bought key.
+
+    Ledger line titles are left unchanged; insights/lookup treat them as one.
+    """
+    norms: list[str] = []
+    seen_norm: set[str] = set()
+    for title in titles:
+        norm = normalize_title(title)
+        if not norm or norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        norms.append(norm)
+    if len(norms) < 2:
+        raise ValueError("Select at least two distinct products to merge.")
+
+    parents = load_alias_parents(profile)
+    roots = {resolve_alias(norm, parents) for norm in norms}
+    events = iter_purchase_events(profile)
+    by_norm = group_events_by_normalized(events)
+
+    def events_for_root(root: str) -> list[PurchaseEvent]:
+        out: list[PurchaseEvent] = []
+        for norm, group in by_norm.items():
+            if resolve_alias(norm, parents) == root:
+                out.extend(group)
+        return out
+
+    best: PurchaseEvent | None = None
+    for root in roots:
+        for event in events_for_root(root):
+            if best is None or _event_recency_key(event) > _event_recency_key(best):
+                best = event
+    if best is None:
+        raise ValueError("No purchase history found for the selected titles.")
+
+    canonical = best.normalized_title
+    keys_to_remap: set[str] = set(roots)
+    for alias_key in parents:
+        if resolve_alias(alias_key, parents) in roots:
+            keys_to_remap.add(alias_key)
+
+    # Also remap every normalized title currently resolving into these roots.
+    for norm in by_norm:
+        if resolve_alias(norm, parents) in roots:
+            keys_to_remap.add(norm)
+
+    exclusion_keys = set(keys_to_remap)
+    for root in roots:
+        for event in events_for_root(root):
+            if event.family_key:
+                exclusion_keys.add(event.family_key)
+
+    key_list = sorted(exclusion_keys)
+    for i, key_a in enumerate(key_list):
+        for key_b in key_list[i + 1 :]:
+            a, b = exclusion_pair(key_a, key_b)
+            if a == b:
+                continue
+            PurchaseExclusion.objects.filter(
+                profile=profile, key_a=a, key_b=b
+            ).delete()
+
+    aliased = 0
+    for key in keys_to_remap:
+        if key == canonical:
+            PurchaseAlias.objects.filter(profile=profile, alias_key=key).delete()
+            continue
+        PurchaseAlias.objects.update_or_create(
+            profile=profile,
+            alias_key=key,
+            defaults={"canonical_key": canonical, "owner": owner},
+        )
+        aliased += 1
+
+    return {
+        "canonical_key": canonical,
+        "display_title": best.title,
+        "aliased_count": aliased,
+        "merged_keys": sorted(keys_to_remap),
     }
 
 
@@ -395,17 +524,24 @@ def stats_to_dict(stats: MatchStats) -> dict:
 
 
 def build_product_history(profile, title: str) -> dict | None:
-    """Full unit-price trail for one normalized title (chronological ascending)."""
+    """Full unit-price trail for one product (includes aliased titles)."""
     norm = normalize_title(title)
     if not norm:
         return None
 
+    parents = load_alias_parents(profile)
+    canon = resolve_alias(norm, parents)
     regular_marks = load_regular_marks(profile)
-    events = [e for e in iter_purchase_events(profile) if e.normalized_title == norm]
+    events = [
+        e
+        for e in iter_purchase_events(profile)
+        if e.normalized_title
+        and resolve_alias(e.normalized_title, parents) == canon
+    ]
     if not events:
         return None
 
-    manually = events[0].family_key in regular_marks
+    manually = any(e.family_key in regular_marks for e in events)
     stats = build_stats_for_events(events, manually_regular=manually)
     if not stats:
         return None
@@ -414,6 +550,7 @@ def build_product_history(profile, title: str) -> dict | None:
         events, key=lambda e: (e.date_effective, e.transaction_id or 0, e.item_id or 0)
     )
     payload = stats_to_dict(stats)
+    payload["normalized_title"] = canon
     payload["purchases"] = [event_to_dict(e) for e in chronological]
     return payload
 
@@ -467,32 +604,48 @@ def lookup_purchases(profile, query: str, limit: int = 5) -> list[dict]:
     query_fam = family_key(query)
     exclusions = load_exclusions(profile)
     regular_marks = load_regular_marks(profile)
+    parents = load_alias_parents(profile)
     events = iter_purchase_events(profile)
-    by_norm = group_events_by_normalized(events)
+    by_canon = group_events_by_canonical(events, parents)
     by_family = group_events_by_family(events)
 
     scored: list[tuple[float, str, str, list[PurchaseEvent]]] = []
-    for norm, group in by_norm.items():
-        if is_excluded(exclusions, query_norm, norm):
+    for canon, group in by_canon.items():
+        newest = max(group, key=_event_recency_key)
+        fam = newest.family_key
+        if is_excluded(exclusions, query_norm, canon):
             continue
-        fam = group[0].family_key
         if is_excluded(exclusions, query_fam, fam):
             continue
-        score, kind = score_query_against_title(query_norm, query_fam, norm, fam)
-        if score <= 0:
+        # Best score against any title in the merged group (incl. aliases).
+        best_score = 0.0
+        best_kind = "none"
+        for event in group:
+            if is_excluded(exclusions, query_norm, event.normalized_title):
+                continue
+            if is_excluded(exclusions, query_fam, event.family_key):
+                continue
+            score, kind = score_query_against_title(
+                query_norm, query_fam, event.normalized_title, event.family_key
+            )
+            if score > best_score:
+                best_score = score
+                best_kind = kind
+        if best_score <= 0:
             continue
-        scored.append((score, kind, norm, group))
+        scored.append((best_score, best_kind, canon, group))
 
     scored.sort(key=lambda row: (-row[0], -len(row[3])))
     results: list[dict] = []
     today = timezone.localdate()
 
-    for score, kind, norm, group in scored[:limit]:
-        fam = group[0].family_key
-        manually = fam in regular_marks
+    for score, kind, canon, group in scored[:limit]:
+        newest = max(group, key=_event_recency_key)
+        fam = newest.family_key
+        manually = any(e.family_key in regular_marks for e in group)
         stats = build_stats_for_events(
             group,
-            display_title=group[0].title,
+            display_title=newest.title,
             manually_regular=manually,
             today=today,
             match_kind=kind,
@@ -501,22 +654,26 @@ def lookup_purchases(profile, query: str, limit: int = 5) -> list[dict]:
         if not stats:
             continue
 
-        # Related siblings: same family, different normalized title
+        # Related siblings: same family, different canonical product
         related = []
         for sibling in by_family.get(fam, []):
-            if sibling.normalized_title == norm:
+            sibling_canon = resolve_alias(sibling.normalized_title, parents)
+            if sibling_canon == canon:
                 continue
-            if is_excluded(exclusions, norm, sibling.normalized_title):
+            if is_excluded(exclusions, canon, sibling.normalized_title):
                 continue
             related.append(sibling)
         if related:
-            # Group related by their normalized titles
-            related_groups = group_events_by_normalized(related)
+            related_groups = group_events_by_canonical(related, parents)
             related_stats = []
-            for r_norm, r_group in list(related_groups.items())[:5]:
+            for r_canon, r_group in list(related_groups.items())[:5]:
+                r_newest = max(r_group, key=_event_recency_key)
                 r_stats = build_stats_for_events(
                     r_group,
-                    manually_regular=r_group[0].family_key in regular_marks,
+                    display_title=r_newest.title,
+                    manually_regular=any(
+                        e.family_key in regular_marks for e in r_group
+                    ),
                     today=today,
                     match_kind="related",
                     score=0.45,
@@ -526,7 +683,7 @@ def lookup_purchases(profile, query: str, limit: int = 5) -> list[dict]:
                     related_stats.append(
                         {
                             "display_title": r_stats.display_title,
-                            "normalized_title": r_stats.normalized_title,
+                            "normalized_title": r_canon,
                             "purchase_count": r_stats.purchase_count,
                             "typical_price": _decimal_str(r_stats.typical_price),
                             "last_purchased_at": (
@@ -539,31 +696,35 @@ def lookup_purchases(profile, query: str, limit: int = 5) -> list[dict]:
                     )
             stats.related = related_stats
 
-        results.append(stats_to_dict(stats))
+        payload = stats_to_dict(stats)
+        payload["normalized_title"] = canon
+        results.append(payload)
 
     return results
 
 
 def build_insights(profile) -> dict:
     regular_marks = load_regular_marks(profile)
+    parents = load_alias_parents(profile)
     events = iter_purchase_events(profile)
-    by_norm = group_events_by_normalized(events)
+    by_canon = group_events_by_canonical(events, parents)
     today = timezone.localdate()
 
     regular, lapsed, due_soon, recently_seen = [], [], [], []
 
-    for norm, group in by_norm.items():
-        fam = group[0].family_key
-        # Skip if excluded against itself somehow — N/A
-        manually = fam in regular_marks
+    for canon, group in by_canon.items():
+        newest = max(group, key=_event_recency_key)
+        manually = any(e.family_key in regular_marks for e in group)
         stats = build_stats_for_events(
             group,
+            display_title=newest.title,
             manually_regular=manually,
             today=today,
         )
         if not stats:
             continue
         payload = stats_to_dict(stats)
+        payload["normalized_title"] = canon
 
         if stats.status == "regular":
             regular.append(payload)
@@ -586,6 +747,18 @@ def build_insights(profile) -> dict:
             row.get("display_title") or "",
         )
 
+    def activity_rank_key(row):
+        """Favor frequent buys that are still relatively recent.
+
+        score = purchase_count / (days_since_last + 1); tie-break by last buy date.
+        """
+        count = row.get("purchase_count") or 0
+        days = row.get("days_since_last")
+        if days is None:
+            days = 10_000
+        score = count / (days + 1)
+        return (score, row.get("last_purchased_at") or "")
+
     regular.sort(key=sort_key)
     lapsed.sort(
         key=lambda r: (-(r.get("days_since_last") or 0), r.get("display_title") or "")
@@ -593,24 +766,14 @@ def build_insights(profile) -> dict:
     due_soon.sort(
         key=lambda r: (-(r.get("days_since_last") or 0), r.get("display_title") or "")
     )
-    recently_seen.sort(
-        key=lambda r: (r.get("last_purchased_at") or "", r.get("display_title") or ""),
-        reverse=True,
-    )
+    recently_seen.sort(key=activity_rank_key, reverse=True)
 
     by_title: dict[str, dict] = {}
     for row in regular + lapsed + recently_seen:
         key = row.get("normalized_title") or ""
         if key:
             by_title[key] = row
-    all_items = sorted(
-        by_title.values(),
-        key=lambda r: (
-            r.get("last_purchased_at") or "",
-            r.get("display_title") or "",
-        ),
-        reverse=True,
-    )
+    all_items = sorted(by_title.values(), key=activity_rank_key, reverse=True)
 
     return {
         "all": all_items,

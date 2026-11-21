@@ -6,6 +6,7 @@ from .models import (
     BudgetProfileMembership,
     Category,
     PaymentContact,
+    PurchaseAlias,
     PurchaseExclusion,
     PurchaseRegularMark,
     Transaction,
@@ -21,3 +22,4 @@ admin.site.register(Transaction)
 admin.site.register(TransactionItem)
 admin.site.register(PurchaseRegularMark)
 admin.site.register(PurchaseExclusion)
+admin.site.register(PurchaseAlias)

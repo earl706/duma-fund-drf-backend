@@ -15,6 +15,7 @@ from .profile_views import (
 )
 from .purchases import (
     PurchaseExcludeView,
+    PurchaseMergeView,
     PurchaseHistoryView,
     PurchaseInsightsView,
     PurchaseLookupView,
@@ -136,6 +137,11 @@ urlpatterns = [
         "finance/purchases/exclude/",
         PurchaseExcludeView.as_view(),
         name="finance-purchase-exclude",
+    ),
+    path(
+        "finance/purchases/merge/",
+        PurchaseMergeView.as_view(),
+        name="finance-purchase-merge",
     ),
     path(
         "finance/transactions/scan-receipt/",

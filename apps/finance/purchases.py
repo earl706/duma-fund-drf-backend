@@ -16,9 +16,10 @@ from .purchase_match import (
     exclusion_pair,
     family_key,
     lookup_purchases,
+    merge_purchase_titles,
     normalize_title,
 )
-from .scope import ProfileScopedAPIView, require_role
+from .scope import LEDGER_WRITE_ROLES, ProfileScopedAPIView, require_role
 
 
 class PurchaseLookupView(ProfileScopedAPIView):
@@ -139,3 +140,21 @@ class PurchaseExcludeView(ProfileScopedAPIView):
             {"key_a": exclusion.key_a, "key_b": exclusion.key_b, "created": created},
             status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
         )
+
+
+class PurchaseMergeView(ProfileScopedAPIView):
+    """POST {titles: [...]} — alias products as one (owner or editor)."""
+
+    def post(self, request):
+        require_role(self.get_membership(), *LEDGER_WRITE_ROLES)
+        raw = request.data.get("titles")
+        if not isinstance(raw, list):
+            raise ValidationError({"titles": "Provide a list of product titles."})
+        titles = [str(t).strip() for t in raw if str(t).strip()]
+        try:
+            result = merge_purchase_titles(
+                self.get_profile(), request.user, titles
+            )
+        except ValueError as exc:
+            raise ValidationError({"detail": str(exc)}) from exc
+        return Response(result, status=status.HTTP_200_OK)

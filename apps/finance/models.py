@@ -433,3 +433,26 @@ class PurchaseExclusion(OwnedModel):
 
     def __str__(self):
         return f"exclude:{self.key_a}|{self.key_b}"
+
+
+class PurchaseAlias(OwnedModel):
+    """Maps an alternate normalized_title to a canonical key (insights/lookup merge)."""
+
+    profile = models.ForeignKey(
+        BudgetProfile,
+        on_delete=models.CASCADE,
+        related_name="purchase_aliases",
+    )
+    alias_key = models.CharField(max_length=255, db_index=True)
+    canonical_key = models.CharField(max_length=255, db_index=True)
+
+    class Meta(OwnedModel.Meta):
+        constraints = [
+            models.UniqueConstraint(
+                fields=["profile", "alias_key"],
+                name="finance_purchase_alias_unique_profile_key",
+            )
+        ]
+
+    def __str__(self):
+        return f"alias:{self.alias_key}->{self.canonical_key}"
