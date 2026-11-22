@@ -35,6 +35,7 @@ from .serializers import (
     LINE_TOTAL,
     sync_expense_amount,
 )
+from .transaction_order import move_transaction, next_day_order
 
 
 def _unlink_or_reassign_category(category, target, profile):
@@ -228,7 +229,9 @@ class BalanceSourceViewSet(ProfileScopedViewSet):
             # Internal moves that credited this source: retarget destination.
             Transaction.objects.filter(to_source=source).update(to_source=target)
             # Collapse invalid same-source internal rows to unpaired transfer_out.
-            Transaction.objects.filter(source=F("to_source"), to_source__isnull=False).update(
+            Transaction.objects.filter(
+                source=F("to_source"), to_source__isnull=False
+            ).update(
                 to_source=None,
                 fee=0,
             )
@@ -281,7 +284,9 @@ class InternalTransferCreateView(ProfileScopedAPIView):
 
     def post(self, request):
         self.assert_write()
-        ser = InternalTransferSerializer(data=request.data, context={"request": request})
+        ser = InternalTransferSerializer(
+            data=request.data, context={"request": request}
+        )
         ser.is_valid(raise_exception=True)
         data = ser.validated_data
         profile = self.get_profile()
@@ -346,6 +351,7 @@ class TransactionViewSet(ProfileScopedViewSet):
         "category__name",
         "date_created",
         "date_effective",
+        "day_order",
         "date_last_modified",
         "created_at",
         "updated_at",
@@ -379,19 +385,56 @@ class TransactionViewSet(ProfileScopedViewSet):
     def perform_create(self, serializer):
         txn_type = serializer.validated_data.get("type")
         user = self.request.user
+        profile = self.get_profile()
         extras = {
             "owner": user,
             "updated_by": user,
-            "profile": self.get_profile(),
+            "profile": profile,
         }
+        if "day_order" not in self.request.data:
+            effective = serializer.validated_data.get("date_effective")
+            if effective is None:
+                from django.utils import timezone
+
+                effective = timezone.localdate()
+            extras["day_order"] = next_day_order(profile.id, effective)
         if txn_type in ("transfer_in", "transfer_out"):
             serializer.save(category=None, **extras)
         else:
             serializer.save(**extras)
 
     def perform_update(self, serializer):
+        # Honor explicit amount edits; item CRUD still re-syncs via nested views.
+        amount_explicit = "amount" in serializer.validated_data
         instance = serializer.save(updated_by=self.request.user)
-        sync_expense_amount(instance)
+        if not amount_explicit:
+            sync_expense_amount(instance)
+
+    @action(detail=True, methods=["post"], url_path="move")
+    def move(self, request, pk=None):
+        """Reorder within day or jump date_effective across calendar days."""
+        direction = (request.data or {}).get("direction")
+        if direction not in ("up", "down"):
+            raise ValidationError({"direction": "Must be 'up' or 'down'."})
+        row = self.get_object()
+        result = move_transaction(row, direction, user=request.user)
+        touched_ids = [p["id"] for p in result["patches"]]
+        results = []
+        if touched_ids:
+            qs = self.filter_queryset(self.get_queryset()).filter(id__in=touched_ids)
+            by_id = {t.id: t for t in qs}
+            results = [
+                TransactionSerializer(by_id[i], context={"request": request}).data
+                for i in touched_ids
+                if i in by_id
+            ]
+        return Response(
+            {
+                "moved": result["moved"],
+                "patches": result["patches"],
+                "results": results,
+            }
+        )
 
 
 # -----------------------------------------------------------------------------

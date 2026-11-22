@@ -411,6 +411,7 @@ class TransactionSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+
     class Meta:
         model = Transaction
         fields = [
@@ -431,6 +432,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             "status",
             "date_created",
             "date_effective",
+            "day_order",
             "date_last_modified",
             "items_total",
             "item_count",
@@ -610,7 +612,10 @@ class TransactionSerializer(serializers.ModelSerializer):
             # Unpaired / non-internal: fee is not used.
             if "fee" in attrs or (self.instance is None):
                 attrs["fee"] = Decimal("0.00")
-            if txn_type in ("income", "expense", "transfer_in") and "to_source" in attrs:
+            if (
+                txn_type in ("income", "expense", "transfer_in")
+                and "to_source" in attrs
+            ):
                 attrs["to_source"] = None
 
         return attrs
@@ -764,7 +769,9 @@ class BulkCommitReceiptSerializer(serializers.Serializer):
 class InternalTransferSerializer(serializers.Serializer):
     from_source = serializers.IntegerField()
     to_source = serializers.IntegerField()
-    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, min_value=Decimal("0.01")
+    )
     fee = serializers.DecimalField(
         max_digits=14,
         decimal_places=2,

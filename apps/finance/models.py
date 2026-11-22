@@ -272,8 +272,6 @@ class Transaction(OwnedModel):
         on_delete=models.PROTECT,
         related_name="transactions",
     )
-    # Internal wallet move: credit this source by `amount` while `source` is debited
-    # amount + fee. Null for income/expense and unpaired external transfers.
     to_source = models.ForeignKey(
         BalanceSource,
         on_delete=models.PROTECT,
@@ -288,7 +286,6 @@ class Transaction(OwnedModel):
         default=Decimal("0.00"),
         validators=[MinValueValidator(Decimal("0"))],
     )
-    # Fee charged on `source` for internal moves (to_source set). Ignored otherwise.
     fee = models.DecimalField(
         max_digits=14,
         decimal_places=2,
@@ -298,8 +295,6 @@ class Transaction(OwnedModel):
     title = models.CharField(max_length=255, blank=True)
     merchant = models.CharField(max_length=255, blank=True, default="")
     note = models.TextField(blank=True)
-    # Primary category: required for income/expense; null for transfers.
-    # For expenses, also mirrored in `categories` (M2M, max MAX_EXPENSE_CATEGORIES).
     category = models.ForeignKey(
         Category,
         on_delete=models.PROTECT,
@@ -315,13 +310,13 @@ class Transaction(OwnedModel):
     receipt_image = models.ImageField(
         upload_to="receipts/%Y/%m/", blank=True, null=True
     )
-    # True when logged expense lines are intentionally incomplete vs the receipt.
     is_partial = models.BooleanField(default=False)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="active")
     date_created = models.DateField(default=today)
     date_effective = models.DateField(default=today)
+    # Lower = higher in the day group under default (-date_effective, day_order, …).
+    day_order = models.PositiveIntegerField(default=0)
     date_last_modified = models.DateField(auto_now=True)
-    # Last user who edited this header (or its line items). Null → fall back to owner.
     updated_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -331,7 +326,7 @@ class Transaction(OwnedModel):
     )
 
     class Meta(OwnedModel.Meta):
-        ordering = ["-date_effective", "-created_at"]
+        ordering = ["-date_effective", "day_order", "-created_at"]
 
     def __str__(self):
         return f"{self.type} {self.amount} ({self.title or self.pk})"
