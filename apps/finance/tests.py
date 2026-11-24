@@ -955,3 +955,34 @@ class InternalTransferTests(APITestCase):
         self.assertEqual(by_id[self.cash.id]["balance"], "500.00")
         self.assertEqual(by_id[self.gcash.id]["balance"], "50.00")
         self.assertEqual(bal.data["balance"], "550.00")
+
+    def test_transfer_in_source_patch_clears_stale_to_source(self):
+        """Type-changed moves left to_source set; source edits must still save."""
+        bank = BalanceSource.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            name="BPI",
+            kind="bank",
+        )
+        txn = Transaction.objects.create(
+            owner=self.user,
+            profile=self.profile,
+            type="transfer_in",
+            title="Payroll",
+            amount=Decimal("100.00"),
+            source=self.cash,
+            to_source=self.gcash,
+            fee=Decimal("5.00"),
+            date_created=timezone.localdate(),
+            date_effective=timezone.localdate(),
+        )
+        patched = self.client.patch(
+            f"/api/finance/transactions/{txn.id}/",
+            {"source": bank.id},
+            format="json",
+            **self.headers,
+        )
+        self.assertEqual(patched.status_code, 200, patched.data)
+        self.assertEqual(patched.data["source"], bank.id)
+        self.assertIsNone(patched.data["to_source"])
+        self.assertEqual(patched.data["fee"], "0.00")

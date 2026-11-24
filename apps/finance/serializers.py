@@ -591,11 +591,13 @@ class TransactionSerializer(serializers.ModelSerializer):
         to_source = attrs.get("to_source", serializers.empty)
         if to_source is serializers.empty:
             to_source = getattr(self.instance, "to_source", None)
+        if to_source is not None and txn_type != "transfer_out":
+            # Stale destination after a type change (e.g. move → transfer_in)
+            # must not block unrelated patches like source.
+            attrs["to_source"] = None
+            attrs["fee"] = Decimal("0.00")
+            to_source = None
         if to_source is not None:
-            if txn_type != "transfer_out":
-                raise ValidationError(
-                    {"to_source": "Destination is only valid on transfer_out."}
-                )
             if profile is None or to_source.profile_id != profile.id:
                 raise ValidationError({"to_source": "Invalid balance source."})
             keeping_to = (
